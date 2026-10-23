@@ -190,13 +190,15 @@ if run:
         total_revenue = ozon_sales["revenue"].sum() if not ozon_sales.empty else 0
         total_units = ozon_sales["ordered_units"].sum() if not ozon_sales.empty else 0
 
-        # Баллы из realization (поле может называться по-разному)
+        # Баллы из realization (может не работать)
         bonus_points = 0
-        if real:
-            # Обычно в result есть rows или summary
+        if isinstance(real, dict) and real:
             rows = real.get("rows") or real.get("items") or []
             for row in rows:
-                bonus_points += float(row.get("bonus") or row.get("points_for_discounts") or 0)
+                try:
+                    bonus_points += float(row.get("bonus") or row.get("points_for_discounts") or 0)
+                except (TypeError, ValueError):
+                    pass
 
         # Расходы из транзакций (amount отрицательные)
         total_expenses = 0
@@ -213,7 +215,10 @@ if run:
             )
             merged["cost_total"] = merged["cost_price"].fillna(0) * merged["ordered_units"].fillna(0)
             merged["gross_profit"] = merged["revenue"].fillna(0) - merged["cost_total"]
-            merged["margin_pct"] = (merged["gross_profit"] / merged["revenue"].replace(0, pd.NA) * 100).round(1)
+            # Безопасный расчёт маржи без краша на NaN
+            revenue_safe = merged["revenue"].fillna(0)
+            merged["margin_pct"] = (merged["gross_profit"] / revenue_safe.replace(0, pd.NA) * 100).round(1)
+            merged["margin_pct"] = merged["margin_pct"].fillna(0)
         else:
             merged = ozon_sales.copy()
             merged["cost_price"] = 0
