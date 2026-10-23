@@ -9,11 +9,26 @@ st.set_page_config(page_title="Ozon + МойСклад — Прибыльнос�
 st.title("📊 Аналитика прибыльности: Ozon + МойСклад")
 st.caption("Выручка и все расходы с Озона (включая баллы за скидки) + себестоимость из МоегоСклада. Матчинг: артикул Озона = код товара в МС.")
 
+# Берём ключи из secrets, если есть, иначе из полей
+def get_secret(key, default=""):
+    try:
+        return st.secrets[key]
+    except Exception:
+        return default
+
 with st.sidebar:
     st.header("🔑 Ключи")
-    ozon_client_id = st.text_input("Ozon Client-Id", type="password")
-    ozon_api_key = st.text_input("Ozon Api-Key", type="password")
-    ms_token = st.text_input("МойСклад Bearer Token", type="password")
+    has_secrets = False
+    try:
+        _ = st.secrets["OZON_CLIENT_ID"]
+        has_secrets = True
+        st.success("Ключи загружены из Secrets")
+    except Exception:
+        st.info("Secrets не найдены — введи вручную")
+
+    ozon_client_id = get_secret("OZON_CLIENT_ID") or st.text_input("Ozon Client-Id", type="password")
+    ozon_api_key = get_secret("OZON_API_KEY") or st.text_input("Ozon Api-Key", type="password")
+    ms_token = get_secret("MS_TOKEN") or st.text_input("МойСклад Bearer Token", type="password")
 
     st.header("📅 Период")
     col1, col2 = st.columns(2)
