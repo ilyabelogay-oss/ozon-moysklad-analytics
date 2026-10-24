@@ -8,7 +8,7 @@ from collections import defaultdict
 st.set_page_config(page_title="Ozon + МойСклад — Юнит-экономика", layout="wide", page_icon="📊")
 
 st.title("📊 Юнит-экономика: Ozon + МойСклад")
-st.caption("Начисления с Озона + себестоимость из МС. Выручка из analytics, расходы из accrual.")
+st.caption("Начисления с Озона + себестоимость из МС.")
 
 def get_secret(key, default=""):
     try:
@@ -89,51 +89,6 @@ def fetch_accruals_by_period(cid, key, d_from, d_to):
         time.sleep(0.2)
     return all_accruals
 
-@st.cache_data(ttl=300)
-def fetch_ozon_analytics_revenue(cid, key, d_from, d_to):
-    url = "https://api-seller.ozon.ru/v1/analytics/data"
-    all_rows = []
-    offset = 0
-    limit = 1000
-    while True:
-        payload = {
-            "date_from": d_from.strftime("%Y-%m-%d"),
-            "date_to": d_to.strftime("%Y-%m-%d"),
-            "metrics": ["revenue", "ordered_units", "delivered_units"],
-            "dimension": ["sku"],
-            "limit": limit,
-            "offset": offset
-        }
-        r = ozon_post_with_retry(url, ozon_headers(cid, key), payload)
-        if r.status_code != 200:
-            break
-        data = r.json().get("result", {}).get("data", [])
-        if not data:
-            break
-        for item in data:
-            dims = item.get("dimensions", [])
-            mets = item.get("metrics", [])
-            if dims:
-                all_rows.append({
-                    "sku": str(dims[0].get("id")),
-                    "name": dims[0].get("name"),
-                    "analytics_revenue": mets[0] if len(mets) > 0 else 0,
-                    "ordered_units": mets[1] if len(mets) > 1 else 0,
-                    "delivered_units": mets[2] if len(mets) > 2 else 0
-                })
-        if len(data) < limit:
-            break
-        offset += limit
-        time.sleep(0.3)
-    df = pd.DataFrame(all_rows)
-    if not df.empty:
-        df = df.groupby(["sku", "name"], as_index=False).agg({
-            "analytics_revenue": "sum",
-            "ordered_units": "sum",
-            "delivered_units": "sum"
-        })
-    return df
-
 def categorize_type(type_id, type_map):
     name = type_map.get(type_id, "")
     if any(x in name for x in ["логист", "delivery", "магистр", "последн"]):
@@ -144,47 +99,46 @@ def categorize_type(type_id, type_map):
         return "returns"
     if any(x in name for x in ["реклам", "promo", "клик", "заказ", "звёзд", "бренд"]):
         return "ads"
-    if any(x in name for x in ["вознагражд", "комисси", "reward"]):
-        return "ozon_reward"
-    if any(x in name for x in ["балл", "скидк", "bonus", "партнёр"]):
-        return "discount_points"
-    if any(x in name for x in ["выручк", "продаж", "sale"]):
-        return "revenue"
     return "other_expenses"
 
 def aggregate_by_sku(accruals, type_map):
     sku_data = defaultdict(lambda: defaultdict(float))
-    type_stats = defaultdict(float)
-    positive_samples = []
     for acc in accruals:
-        total_amt = float((acc.get("total_amount") or {}).get("amount") or 0)
-        if total_amt > 100 and len(positive_samples) < 5:
-            positive_samples.append(acc)
-
         posting = acc.get("posting") or {}
         for prod in posting.get("products") or []:
             sku = str(prod.get("sku") or "")
             if not sku or sku == "0":
                 continue
+
+            # Commission — главное
+            comm = prod.get("commission")
+            if isinstance(comm, dict):
+                # Выручка
+                sale_amt = comm.get("sale_amount") or {}
+                if isinstance(sale_amt, dict):
+                    sku_data[sku]["revenue"] += float(sale_amt.get("amount") or 0)
+                # Баллы
+                bonus = comm.get("bonus") or {}
+                if isinstance(bonus, dict):
+                    sku_data[sku]["discount_points"] += float(bonus.get("amount") or 0)
+                # Вознаграждение Ozon
+                sale_comm = comm.get("sale_commission") or comm.get("commission") or {}
+                if isinstance(sale_comm, dict):
+                    sku_data[sku]["ozon_reward"] += float(sale_comm.get("amount") or 0)
+                # Программы партнёров
+                coinv = comm.get("coinvestment") or {}
+                if isinstance(coinv, dict):
+                    sku_data[sku]["partner_programs"] += float(coinv.get("amount") or 0)
+
+            # Delivery services
             delivery = prod.get("delivery") or {}
             for svc in delivery.get("services") or []:
                 type_id = svc.get("type_id")
                 amount = float((svc.get("accrued") or {}).get("amount") or 0)
                 cat = categorize_type(type_id, type_map)
                 sku_data[sku][cat] += amount
-                type_stats[f"{type_id}:{type_map.get(type_id, '?')}"] += amount
 
-            comm = prod.get("commission")
-            if isinstance(comm, dict):
-                for key in ["bonus", "coinvestment", "commission"]:
-                    val = comm.get(key)
-                    if isinstance(val, dict):
-                        amt = float(val.get("amount") or 0)
-                        if key == "bonus":
-                            sku_data[sku]["discount_points"] += amt
-                        else:
-                            sku_data[sku]["ozon_reward"] += amt
-
+        # item_fees
         item_fees = acc.get("item_fees") or {}
         for fee_group in item_fees.get("fees") or []:
             sku = str(fee_group.get("sku") or "")
@@ -195,10 +149,9 @@ def aggregate_by_sku(accruals, type_map):
                 amount = float((f.get("accrued") or {}).get("amount") or 0)
                 cat = categorize_type(type_id, type_map)
                 sku_data[sku][cat] += amount
-                type_stats[f"{type_id}:{type_map.get(type_id, '?')}"] += amount
 
     rows = [{"sku": sku, **dict(data)} for sku, data in sku_data.items()]
-    return pd.DataFrame(rows), type_stats, positive_samples
+    return pd.DataFrame(rows)
 
 @st.cache_data(ttl=600)
 def fetch_sku_to_offer(cid, key, skus):
@@ -257,41 +210,22 @@ if run:
     type_map = fetch_accrual_types(ozon_client_id, ozon_api_key)
 
     status.info("Начисления Ozon...")
-    progress.progress(30)
+    progress.progress(40)
     accruals = fetch_accruals_by_period(ozon_client_id, ozon_api_key, date_from, date_to)
 
-    status.info("Analytics (выручка)...")
-    progress.progress(45)
-    analytics = fetch_ozon_analytics_revenue(ozon_client_id, ozon_api_key, date_from, date_to)
-
-    status.info("Агрегация...")
+    status.info("Агрегация по SKU...")
     progress.progress(60)
-    sku_df, type_stats, positive_samples = aggregate_by_sku(accruals, type_map)
-
-    if not analytics.empty:
-        if sku_df.empty:
-            sku_df = analytics.copy()
-            sku_df["revenue"] = sku_df["analytics_revenue"]
-        else:
-            sku_df = sku_df.merge(analytics[["sku", "analytics_revenue", "ordered_units", "delivered_units", "name"]], on="sku", how="outer")
-            if "revenue" not in sku_df.columns:
-                sku_df["revenue"] = 0.0
-            sku_df["revenue"] = sku_df["revenue"].fillna(0)
-            sku_df["revenue"] = sku_df.apply(
-                lambda r: r["analytics_revenue"] if r["revenue"] == 0 else r["revenue"], axis=1
-            )
+    sku_df = aggregate_by_sku(accruals, type_map)
 
     if sku_df.empty:
-        st.warning("Нет данных")
+        st.warning("Не удалось собрать данные")
         st.stop()
 
     status.info("Артикулы...")
     progress.progress(75)
-    offers = fetch_sku_to_offer(ozon_client_id, ozon_api_key, sku_df["sku"].dropna().tolist())
+    offers = fetch_sku_to_offer(ozon_client_id, ozon_api_key, sku_df["sku"].tolist())
     if not offers.empty:
-        sku_df = sku_df.merge(offers, on="sku", how="left", suffixes=("", "_offer"))
-        if "name_offer" in sku_df.columns:
-            sku_df["name"] = sku_df["name"].fillna(sku_df["name_offer"])
+        sku_df = sku_df.merge(offers, on="sku", how="left")
 
     status.info("Себестоимость МС...")
     progress.progress(85)
@@ -303,7 +237,7 @@ if run:
         merged = sku_df.copy()
         merged["cost_price"] = 0
 
-    for col in ["revenue", "ozon_reward", "discount_points", "logistics", "acquiring", "returns", "ads", "other_expenses", "cost_price"]:
+    for col in ["revenue", "discount_points", "ozon_reward", "partner_programs", "logistics", "acquiring", "returns", "ads", "other_expenses", "cost_price"]:
         if col not in merged.columns:
             merged[col] = 0.0
         merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0)
@@ -312,7 +246,10 @@ if run:
         merged["ozon_reward"] + merged["logistics"] + merged["acquiring"] +
         merged["returns"] + merged["ads"] + merged["other_expenses"]
     )
-    merged["profit"] = merged["revenue"] + merged["discount_points"] - merged["total_expenses"] - merged["cost_price"]
+    merged["profit"] = (
+        merged["revenue"] + merged["discount_points"] + merged["partner_programs"]
+        - merged["total_expenses"] - merged["cost_price"]
+    )
     merged["margin_pct"] = (merged["profit"] / merged["revenue"].replace(0, pd.NA) * 100).fillna(0).round(1)
 
     progress.progress(100)
@@ -325,7 +262,7 @@ if run:
     c4.metric("Прибыль", f"{merged['profit'].sum():,.0f} ₽")
 
     st.subheader("Позиции")
-    display_cols = ["sku", "offer_id", "name", "revenue", "discount_points", "ozon_reward", "logistics", "acquiring", "returns", "ads", "other_expenses", "cost_price", "profit", "margin_pct", "ordered_units", "delivered_units"]
+    display_cols = ["sku", "offer_id", "name", "revenue", "discount_points", "partner_programs", "ozon_reward", "logistics", "acquiring", "returns", "ads", "other_expenses", "cost_price", "profit", "margin_pct"]
     display_cols = [c for c in display_cols if c in merged.columns]
 
     col_names = {
@@ -333,8 +270,9 @@ if run:
         "offer_id": "Артикул",
         "name": "Название",
         "revenue": "Выручка",
-        "discount_points": "Баллы",
-        "ozon_reward": "Вознаграждение",
+        "discount_points": "Баллы за скидки",
+        "partner_programs": "Программы партнёров",
+        "ozon_reward": "Вознаграждение Ozon",
         "logistics": "Логистика",
         "acquiring": "Эквайринг",
         "returns": "Возвраты",
@@ -342,9 +280,7 @@ if run:
         "other_expenses": "Прочие",
         "cost_price": "Себестоимость",
         "profit": "Прибыль",
-        "margin_pct": "Маржа %",
-        "ordered_units": "Заказано",
-        "delivered_units": "Доставлено"
+        "margin_pct": "Маржа %"
     }
     display_df = merged[display_cols].rename(columns=col_names).sort_values("Выручка", ascending=False)
 
@@ -352,13 +288,5 @@ if run:
 
     st.download_button("📥 CSV", display_df.to_csv(index=False).encode("utf-8-sig"), "unit_economics.csv", "text/csv")
 
-    with st.expander("Отладка: типы начислений (суммы)"):
-        sorted_types = sorted(type_stats.items(), key=lambda x: abs(x[1]), reverse=True)[:40]
-        st.dataframe(pd.DataFrame(sorted_types, columns=["type_id:name", "sum"]))
-
-    with st.expander("Примеры положительных начислений (где выручка)"):
-        st.write(f"Найдено положительных: {len(positive_samples)}")
-        st.json(positive_samples)
-
 st.markdown("---")
-st.caption("Смотри примеры положительных начислений — там должна быть выручка и баллы.")
+st.caption("Выручка и баллы теперь берутся из commission.sale_amount и commission.bonus.")
