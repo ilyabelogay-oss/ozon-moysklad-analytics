@@ -8,7 +8,7 @@ from collections import defaultdict
 st.set_page_config(page_title="Ozon + МойСклад — Юнит-экономика", layout="wide", page_icon="📊")
 
 st.title("📊 Юнит-экономика: Ozon + МойСклад")
-st.caption("Логистика из delivery.total_accrued. Итого Ozon из total_amount.")
+st.caption("Возвраты ищутся шире. Логистика из delivery.total_accrued.")
 
 def get_secret(key, default=""):
     try:
@@ -93,7 +93,7 @@ def categorize_type(type_id, type_map):
     name = type_map.get(type_id, "")
     if any(x in name for x in ["эквайринг", "acquiring"]):
         return "acquiring"
-    if any(x in name for x in ["возврат", "return", "обратная логистика"]):
+    if any(x in name for x in ["возврат", "return", "обратн", "ретурн"]):
         return "returns"
     if any(x in name for x in ["реклам", "promo", "клик", "заказ", "звёзд", "бренд"]):
         return "ads"
@@ -102,10 +102,12 @@ def categorize_type(type_id, type_map):
 def aggregate_by_sku(accruals, type_map):
     sku_data = defaultdict(lambda: defaultdict(float))
     raw_total = 0.0
+    returns_debug = []
 
     for acc in accruals:
         total_amt = float((acc.get("total_amount") or {}).get("amount") or 0)
         raw_total += total_amt
+        category = (acc.get("accrued_category") or "").upper()
 
         skus_in_acc = []
         posting = acc.get("posting") or {}
@@ -132,13 +134,19 @@ def aggregate_by_sku(accruals, type_map):
             if not sku or sku == "0":
                 continue
 
+            qty = float(prod.get("quantity") or 0)
+            # Если количество отрицательное — это возврат
+            if qty < 0:
+                sku_data[sku]["returns"] += abs(qty)  # штуки возврата
+                returns_debug.append({"sku": sku, "qty": qty, "source": "negative_qty"})
+
             comm = prod.get("commission")
             if isinstance(comm, dict):
                 sale_amt = comm.get("sale_amount") or {}
                 sale_val = float(sale_amt.get("amount") or 0) if isinstance(sale_amt, dict) else 0
                 if sale_val > 0:
                     sku_data[sku]["revenue"] += sale_val
-                    sku_data[sku]["qty"] += float(prod.get("quantity") or 1)
+                    sku_data[sku]["qty"] += qty if qty > 0 else 0
 
                 bonus = comm.get("bonus") or {}
                 if isinstance(bonus, dict):
@@ -152,14 +160,13 @@ def aggregate_by_sku(accruals, type_map):
                 if isinstance(sale_comm, dict):
                     sku_data[sku]["ozon_reward"] += float(sale_comm.get("amount") or 0)
 
-            # Логистика из delivery.total_accrued
             delivery = prod.get("delivery") or {}
             total_acc = delivery.get("total_accrued") or {}
             if isinstance(total_acc, dict):
                 log_amt = float(total_acc.get("amount") or 0)
                 sku_data[sku]["logistics"] += log_amt
 
-        # item_fees — остальные расходы (не логистика)
+        # item_fees
         for fee_group in item_fees.get("fees") or []:
             sku = str(fee_group.get("sku") or "")
             if not sku:
@@ -169,10 +176,18 @@ def aggregate_by_sku(accruals, type_map):
                 amount = float((f.get("accrued") or {}).get("amount") or 0)
                 cat = categorize_type(type_id, type_map)
                 sku_data[sku][cat] += amount
+                if cat == "returns":
+                    returns_debug.append({"sku": sku, "amount": amount, "type_id": type_id, "source": "item_fees"})
+
+        # Если категория начисления содержит RETURN
+        if "RETURN" in category and skus_in_acc:
+            for sku in set(skus_in_acc):
+                sku_data[sku]["returns"] += abs(total_amt)
+                returns_debug.append({"sku": sku, "amount": total_amt, "source": "category"})
 
     rows = [{"sku": sku, **dict(data)} for sku, data in sku_data.items() if sku != "_shared"]
     shared = sku_data.get("_shared", {}).get("ozon_net_raw", 0)
-    return pd.DataFrame(rows), raw_total, shared
+    return pd.DataFrame(rows), raw_total, shared, returns_debug
 
 @st.cache_data(ttl=600)
 def fetch_sku_to_offer(cid, key, skus):
@@ -271,7 +286,7 @@ if run:
 
     status.info("Агрегация по SKU...")
     progress.progress(55)
-    sku_df, raw_total, shared = aggregate_by_sku(accruals, type_map)
+    sku_df, raw_total, shared, returns_debug = aggregate_by_sku(accruals, type_map)
 
     if sku_df.empty:
         st.warning("Не удалось собрать данные")
@@ -292,6 +307,11 @@ if run:
         st.write(f"Найдено артикулов с себестоимостью: {len(ms)}")
         if not ms.empty:
             st.dataframe(ms.head(10))
+
+    with st.expander("Отладка возвратов"):
+        st.write(f"Найдено записей возвратов: {len(returns_debug)}")
+        if returns_debug:
+            st.json(returns_debug[:20])
 
     if not ms.empty and "offer_id" in sku_df.columns:
         merged = sku_df.merge(ms, left_on="offer_id", right_on="ms_code", how="left")
@@ -325,7 +345,7 @@ if run:
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Выручка", f"{merged['revenue'].sum():,.0f} ₽")
-    c2.metric("Баллы + Партнёры", f"{(merged['discount_points'] + merged['partner_programs']).sum():,.0f} ₽")
+    c2.metric("Возвраты", f"{merged['returns'].sum():,.0f} ₽")
     c3.metric("Логистика", f"{merged['logistics'].sum():,.0f} ₽")
     c4.metric("Итого Ozon", f"{merged['ozon_net'].sum():,.0f} ₽")
     c5.metric("Себестоимость", f"{merged['cost_total'].sum():,.0f} ₽")
@@ -378,4 +398,4 @@ if run:
             st.caption(f"Найдено позиций: {len(low_margin)}")
 
 st.markdown("---")
-st.caption("Логистика теперь из delivery.total_accrued (агрегированная сумма по позиции).")
+st.caption("Смотри отладку возвратов — там видно, нашлось ли что-то.")
