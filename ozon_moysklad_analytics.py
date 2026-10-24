@@ -56,21 +56,27 @@ def fetch_ozon_analytics(cid, key, d_from, d_to):
         "limit": 1000,
         "offset": 0
     }
-    r = requests.post(url, headers=ozon_headers(cid, key), json=payload, timeout=60)
-    r.raise_for_status()
-    data = r.json().get("result", {}).get("data", [])
-    rows = []
-    for item in data:
-        dims = item.get("dimensions", [])
-        mets = item.get("metrics", [])
-        if dims:
-            rows.append({
-                "sku": str(dims[0].get("id")),
-                "name": dims[0].get("name"),
-                "revenue": mets[0] if mets else 0,
-                "ordered_units": mets[1] if len(mets) > 1 else 0
-            })
-    return pd.DataFrame(rows)
+    try:
+        r = requests.post(url, headers=ozon_headers(cid, key), json=payload, timeout=60)
+        if r.status_code != 200:
+            st.error(f"Озон analytics ошибка {r.status_code}: {r.text}")
+            return pd.DataFrame()
+        data = r.json().get("result", {}).get("data", [])
+        rows = []
+        for item in data:
+            dims = item.get("dimensions", [])
+            mets = item.get("metrics", [])
+            if dims:
+                rows.append({
+                    "sku": str(dims[0].get("id")),
+                    "name": dims[0].get("name"),
+                    "revenue": mets[0] if mets else 0,
+                    "ordered_units": mets[1] if len(mets) > 1 else 0
+                })
+        return pd.DataFrame(rows)
+    except Exception as e:
+        st.error(f"Озон analytics упал: {e}")
+        return pd.DataFrame()
 
 @st.cache_data(ttl=600)
 def fetch_ozon_sku_to_offer(cid, key, skus):
@@ -176,6 +182,10 @@ if run:
         status.info("Тянем продажи с Озона...")
         progress.progress(10)
         ozon_sales = fetch_ozon_analytics(ozon_client_id, ozon_api_key, date_from, date_to)
+
+        if ozon_sales.empty:
+            st.warning("Озон не вернул продаж. Смотри ошибку выше и проверь ключи/период.")
+            st.stop()
 
         status.info("Достаём артикулы (offer_id)...")
         progress.progress(25)
