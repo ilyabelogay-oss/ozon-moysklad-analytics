@@ -302,7 +302,6 @@ if run:
             merged[col] = 0.0
         merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0)
 
-    # Блоки составляющих
     merged["sales"] = merged["revenue"] + merged["discount_points"] + merged["partner_programs"]
     merged["expenses"] = merged["ozon_reward"] + merged["logistics"] + merged["acquiring"] + merged["returns"] + merged["ads"] + merged["other_expenses"]
     merged["ozon_net"] = merged["ozon_net_raw"]
@@ -310,17 +309,23 @@ if run:
     merged["profit"] = merged["ozon_net"] - merged["cost_total"]
     merged["margin_pct"] = (merged["profit"] / merged["revenue"].replace(0, pd.NA) * 100).fillna(0).round(1)
 
+    # Общая маржа
+    total_revenue = merged["revenue"].sum()
+    total_profit = merged["profit"].sum()
+    overall_margin = (total_profit / total_revenue * 100) if total_revenue > 0 else 0
+
     progress.progress(100)
     status.success("Готово")
 
     st.info(f"Сырой итог total_amount: {raw_total:,.0f} ₽")
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Продажи", f"{merged['sales'].sum():,.0f} ₽")
     c2.metric("Расходы", f"{merged['expenses'].sum():,.0f} ₽")
     c3.metric("Итого Ozon", f"{merged['ozon_net'].sum():,.0f} ₽")
     c4.metric("Себестоимость", f"{merged['cost_total'].sum():,.0f} ₽")
     c5.metric("Прибыль", f"{merged['profit'].sum():,.0f} ₽")
+    c6.metric("Маржа", f"{overall_margin:.1f} %")
 
     st.subheader("Позиции")
     display_cols = [
@@ -362,4 +367,4 @@ if run:
     st.download_button("📥 CSV", display_df.to_csv(index=False).encode("utf-8-sig"), "unit_economics.csv", "text/csv")
 
 st.markdown("---")
-st.caption("Продажи = Выручка + Баллы + Партнёры. Расходы = Вознаграждение + Логистика + Эквайринг + Возвраты + Реклама + Прочие. Итого Ozon берётся из total_amount.")
+st.caption("Маржа % = Прибыль / Выручка × 100. Общая маржа — по всем позициям.")
