@@ -45,6 +45,16 @@ def ozon_headers(cid, key):
 def ms_headers(token):
     return {"Authorization": f"Bearer {token}", "Accept-Encoding": "gzip"}
 
+def ozon_post_with_retry(url, headers, payload, max_retries=5):
+    for attempt in range(max_retries):
+        r = requests.post(url, headers=headers, json=payload, timeout=60)
+        if r.status_code == 429:
+            wait = 1.5 * (attempt + 1)
+            time.sleep(wait)
+            continue
+        return r
+    return r
+
 @st.cache_data(ttl=300)
 def fetch_ozon_analytics(cid, key, d_from, d_to):
     url = "https://api-seller.ozon.ru/v1/analytics/data"
@@ -57,7 +67,7 @@ def fetch_ozon_analytics(cid, key, d_from, d_to):
         "offset": 0
     }
     try:
-        r = requests.post(url, headers=ozon_headers(cid, key), json=payload, timeout=60)
+        r = ozon_post_with_retry(url, ozon_headers(cid, key), payload)
         if r.status_code != 200:
             st.error(f"Озон analytics ошибка {r.status_code}: {r.text}")
             return pd.DataFrame()
@@ -89,7 +99,7 @@ def fetch_ozon_sku_to_offer(cid, key, skus):
         chunk = skus[i:i+100]
         payload = {"sku": [int(s) for s in chunk if str(s).isdigit()]}
         try:
-            r = requests.post(url, headers=ozon_headers(cid, key), json=payload, timeout=30)
+            r = ozon_post_with_retry(url, ozon_headers(cid, key), payload)
             if r.status_code == 200:
                 for item in r.json().get("items", []):
                     sku = str(item.get("sku") or item.get("sources", [{}])[0].get("sku", ""))
@@ -98,7 +108,7 @@ def fetch_ozon_sku_to_offer(cid, key, skus):
                         offer_map[sku] = offer
         except Exception:
             pass
-        time.sleep(0.3)
+        time.sleep(0.5)
     return pd.DataFrame([{"sku": k, "offer_id": v} for k, v in offer_map.items()])
 
 @st.cache_data(ttl=600)
@@ -107,8 +117,10 @@ def fetch_ozon_realization(cid, key, year, month):
     url = "https://api-seller.ozon.ru/v2/finance/realization"
     payload = {"month": month, "year": year}
     try:
-        r = requests.post(url, headers=ozon_headers(cid, key), json=payload, timeout=60)
-        r.raise_for_status()
+        r = ozon_post_with_retry(url, ozon_headers(cid, key), payload)
+        if r.status_code != 200:
+            st.warning(f"Realization не отдался: {r.status_code} {r.text}")
+            return {}
         return r.json().get("result", {})
     except Exception as e:
         st.warning(f"Realization не отдался: {e}")
@@ -133,7 +145,7 @@ def fetch_ozon_transactions_old(cid, key, d_from, d_to):
             "page_size": 1000
         }
         try:
-            r = requests.post(url, headers=ozon_headers(cid, key), json=payload, timeout=60)
+            r = ozon_post_with_retry(url, ozon_headers(cid, key), payload)
             if r.status_code != 200:
                 break
             ops = r.json().get("result", {}).get("operations", [])
@@ -143,7 +155,7 @@ def fetch_ozon_transactions_old(cid, key, d_from, d_to):
             if len(ops) < 1000:
                 break
             page += 1
-            time.sleep(0.4)
+            time.sleep(0.5)
         except Exception:
             break
     return pd.DataFrame(all_ops) if all_ops else pd.DataFrame()
