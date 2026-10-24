@@ -8,7 +8,7 @@ from collections import defaultdict
 st.set_page_config(page_title="Ozon + МойСклад — Юнит-экономика", layout="wide", page_icon="📊")
 
 st.title("📊 Юнит-экономика: Ozon + МойСклад")
-st.caption("Себестоимость из документов приёмки и оприходования МС.")
+st.caption("Себестоимость из приёмок и оприходований МС.")
 
 def get_secret(key, default=""):
     try:
@@ -194,70 +194,63 @@ def fetch_sku_to_offer(cid, key, skus):
         time.sleep(0.4)
     return pd.DataFrame([{"sku": k, **v} for k, v in offer_map.items()])
 
-def fetch_ms_document_costs(token, doc_type):
-    """Тянем себестоимость из supply или enter"""
-    base = "https://api.moysklad.ru/api/remap/1.2/entity"
-    url = f"{base}/{doc_type}"
-    costs = defaultdict(lambda: {"sum_cost": 0.0, "sum_qty": 0.0, "name": ""})
-    offset = 0
-    limit = 100
-    try:
-        while True:
-            r = requests.get(
-                url,
-                headers=ms_headers(token),
-                params={"limit": limit, "offset": offset, "expand": "positions"},
-                timeout=60
-            )
-            if r.status_code != 200:
-                break
-            data = r.json()
-            rows = data.get("rows", [])
-            if not rows:
-                break
-            for doc in rows:
-                positions = doc.get("positions", {}).get("rows", [])
-                for pos in positions:
-                    assortment = pos.get("assortment") or {}
-                    code = assortment.get("code") or assortment.get("article")
-                    if not code:
-                        continue
-                    qty = float(pos.get("quantity") or 0)
-                    price = float(pos.get("price") or 0) / 100.0
-                    if qty > 0 and price > 0:
-                        costs[str(code).strip()]["sum_cost"] += price * qty
-                        costs[str(code).strip()]["sum_qty"] += qty
-                        costs[str(code).strip()]["name"] = assortment.get("name", "")
-            if len(rows) < limit:
-                break
-            offset += limit
-            time.sleep(0.3)
-    except Exception as e:
-        st.warning(f"МС {doc_type}: {e}")
-    return costs
-
 @st.cache_data(ttl=600)
 def fetch_ms_costs(token):
-    """Себестоимость из приёмок и оприходований (средневзвешенная)"""
-    supply = fetch_ms_document_costs(token, "supply")
-    enter = fetch_ms_document_costs(token, "enter")
+    """Себестоимость из supply + enter"""
+    costs = defaultdict(lambda: {"sum_cost": 0.0, "sum_qty": 0.0, "name": ""})
+    debug_info = {"supply_docs": 0, "enter_docs": 0, "positions": 0, "errors": []}
 
-    all_codes = set(supply.keys()) | set(enter.keys())
+    for doc_type in ["supply", "enter"]:
+        url = f"https://api.moysklad.ru/api/remap/1.2/entity/{doc_type}"
+        offset = 0
+        limit = 100
+        try:
+            while True:
+                r = requests.get(
+                    url,
+                    headers=ms_headers(token),
+                    params={"limit": limit, "offset": offset, "expand": "positions.assortment"},
+                    timeout=90
+                )
+                if r.status_code != 200:
+                    debug_info["errors"].append(f"{doc_type} {r.status_code}: {r.text[:200]}")
+                    break
+                data = r.json()
+                rows = data.get("rows", [])
+                if not rows:
+                    break
+                debug_info[f"{doc_type}_docs"] += len(rows)
+                for doc in rows:
+                    positions = doc.get("positions", {}).get("rows", [])
+                    for pos in positions:
+                        debug_info["positions"] += 1
+                        assortment = pos.get("assortment") or {}
+                        code = assortment.get("code") or assortment.get("article")
+                        if not code:
+                            continue
+                        qty = float(pos.get("quantity") or 0)
+                        price = float(pos.get("price") or 0) / 100.0
+                        if qty > 0 and price > 0:
+                            c = str(code).strip()
+                            costs[c]["sum_cost"] += price * qty
+                            costs[c]["sum_qty"] += qty
+                            costs[c]["name"] = assortment.get("name", "")
+                if len(rows) < limit:
+                    break
+                offset += limit
+                time.sleep(0.4)
+        except Exception as e:
+            debug_info["errors"].append(str(e))
+
     data = []
-    for code in all_codes:
-        s = supply.get(code, {"sum_cost": 0, "sum_qty": 0, "name": ""})
-        e = enter.get(code, {"sum_cost": 0, "sum_qty": 0, "name": ""})
-        total_cost = s["sum_cost"] + e["sum_cost"]
-        total_qty = s["sum_qty"] + e["sum_qty"]
-        avg_price = total_cost / total_qty if total_qty > 0 else 0
-        name = s["name"] or e["name"]
-        if avg_price > 0:
+    for code, v in costs.items():
+        if v["sum_qty"] > 0:
             data.append({
                 "ms_code": code,
-                "ms_name": name,
-                "cost_price": avg_price
+                "ms_name": v["name"],
+                "cost_price": v["sum_cost"] / v["sum_qty"]
             })
-    return pd.DataFrame(data)
+    return pd.DataFrame(data), debug_info
 
 if run:
     if not all([ozon_client_id, ozon_api_key, ms_token]):
@@ -289,9 +282,15 @@ if run:
     if not offers.empty:
         sku_df = sku_df.merge(offers, on="sku", how="left")
 
-    status.info("Себестоимость из приёмок и оприходований МС...")
+    status.info("Себестоимость из МС...")
     progress.progress(85)
-    ms = fetch_ms_costs(ms_token)
+    ms, ms_debug = fetch_ms_costs(ms_token)
+
+    with st.expander("Отладка МойСклад"):
+        st.write(ms_debug)
+        st.write(f"Найдено артикулов с себестоимостью: {len(ms)}")
+        if not ms.empty:
+            st.dataframe(ms.head(10))
 
     if not ms.empty and "offer_id" in sku_df.columns:
         merged = sku_df.merge(ms, left_on="offer_id", right_on="ms_code", how="left")
@@ -312,7 +311,7 @@ if run:
     progress.progress(100)
     status.success("Готово")
 
-    st.info(f"Сырой итог total_amount: {raw_total:,.0f} ₽ | Не привязано к SKU: {shared:,.0f} ₽")
+    st.info(f"Сырой итог total_amount: {raw_total:,.0f} ₽")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Итого Ozon", f"{merged['ozon_net'].sum():,.0f} ₽")
@@ -321,12 +320,7 @@ if run:
     c4.metric("Продано шт", f"{merged['qty'].sum():,.0f}")
 
     st.subheader("Позиции")
-    display_cols = [
-        "sku", "offer_id", "name", "qty",
-        "ozon_net", "cost_price", "cost_total", "profit", "margin_pct",
-        "revenue", "discount_points", "partner_programs",
-        "ozon_reward", "logistics", "acquiring"
-    ]
+    display_cols = ["sku", "offer_id", "name", "qty", "ozon_net", "cost_price", "cost_total", "profit", "revenue"]
     display_cols = [c for c in display_cols if c in merged.columns]
 
     col_names = {
@@ -338,13 +332,7 @@ if run:
         "cost_price": "Себестоимость шт",
         "cost_total": "Себестоимость",
         "profit": "Прибыль",
-        "margin_pct": "Маржа %",
-        "revenue": "Выручка",
-        "discount_points": "Баллы",
-        "partner_programs": "Партнёры",
-        "ozon_reward": "Вознаграждение",
-        "logistics": "Логистика",
-        "acquiring": "Эквайринг"
+        "revenue": "Выручка"
     }
     display_df = merged[display_cols].rename(columns=col_names).sort_values("Итого Ozon", ascending=False)
 
@@ -353,4 +341,4 @@ if run:
     st.download_button("📥 CSV", display_df.to_csv(index=False).encode("utf-8-sig"), "unit_economics.csv", "text/csv")
 
 st.markdown("---")
-st.caption("Себестоимость — средневзвешенная из документов приёмки (supply) и оприходования (enter) МоегоСклада.")
+st.caption("Смотри отладку МойСклад — там видно, сколько документов и позиций нашлось.")
