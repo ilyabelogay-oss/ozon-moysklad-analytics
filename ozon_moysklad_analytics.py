@@ -3,13 +3,13 @@ import requests
 import pandas as pd
 from datetime import datetime, timedelta
 import time
+from collections import defaultdict
 
-st.set_page_config(page_title="Ozon + МойСклад — Прибыльность", layout="wide", page_icon="📊")
+st.set_page_config(page_title="Ozon + МойСклад — Юнит-экономика", layout="wide", page_icon="📊")
 
-st.title("📊 Аналитика прибыльности: Ozon + МойСклад")
-st.caption("Выручка и все расходы с Озона (включая баллы за скидки) + себестоимость из МоегоСклада. Матчинг: артикул Озона = код товара в МС.")
+st.title("📊 Юнит-экономика: Ozon + МойСклад")
+st.caption("Полная аналитика по позициям. Начисления с Озона + себестоимость из МС. Матчинг: артикул Озона = код товара в МС.")
 
-# Берём ключи из secrets, если есть, иначе из полей
 def get_secret(key, default=""):
     try:
         return st.secrets[key]
@@ -18,13 +18,11 @@ def get_secret(key, default=""):
 
 with st.sidebar:
     st.header("🔑 Ключи")
-    has_secrets = False
     try:
         _ = st.secrets["OZON_CLIENT_ID"]
-        has_secrets = True
-        st.success("Ключи загружены из Secrets")
+        st.success("Ключи из Secrets")
     except Exception:
-        st.info("Secrets не найдены — введи вручную")
+        st.info("Введи ключи вручную")
 
     ozon_client_id = get_secret("OZON_CLIENT_ID") or st.text_input("Ozon Client-Id", type="password")
     ozon_api_key = get_secret("OZON_API_KEY") or st.text_input("Ozon Api-Key", type="password")
@@ -33,11 +31,11 @@ with st.sidebar:
     st.header("📅 Период")
     col1, col2 = st.columns(2)
     with col1:
-        date_from = st.date_input("С", datetime.now() - timedelta(days=30))
+        date_from = st.date_input("С", datetime.now() - timedelta(days=7))
     with col2:
         date_to = st.date_input("По", datetime.now())
 
-    run = st.button("🚀 Собрать аналитику", type="primary")
+    run = st.button("🚀 Собрать аналитику", type="primary", use_container_width=True)
 
 def ozon_headers(cid, key):
     return {"Client-Id": cid, "Api-Key": key, "Content-Type": "application/json"}
@@ -45,142 +43,143 @@ def ozon_headers(cid, key):
 def ms_headers(token):
     return {"Authorization": f"Bearer {token}", "Accept-Encoding": "gzip"}
 
-def ozon_post_with_retry(url, headers, payload, max_retries=5):
+def ozon_post_with_retry(url, headers, payload, max_retries=6):
     for attempt in range(max_retries):
-        r = requests.post(url, headers=headers, json=payload, timeout=60)
-        if r.status_code == 429:
-            wait = 1.5 * (attempt + 1)
-            time.sleep(wait)
-            continue
-        return r
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=90)
+            if r.status_code == 429:
+                time.sleep(2 ** attempt)
+                continue
+            return r
+        except Exception:
+            time.sleep(1)
     return r
 
+@st.cache_data(ttl=600)
+def fetch_accrual_types(cid, key):
+    url = "https://api-seller.ozon.ru/v1/finance/accrual/types"
+    r = ozon_post_with_retry(url, ozon_headers(cid, key), {})
+    if r.status_code != 200:
+        return {}
+    types = {}
+    for t in r.json().get("accrual_types", []):
+        types[t.get("id")] = t.get("name") or t.get("description") or str(t.get("id"))
+    return types
+
 @st.cache_data(ttl=300)
-def fetch_ozon_analytics(cid, key, d_from, d_to):
-    url = "https://api-seller.ozon.ru/v1/analytics/data"
-    all_rows = []
-    offset = 0
-    limit = 1000
-    while True:
-        payload = {
-            "date_from": d_from.strftime("%Y-%m-%d"),
-            "date_to": d_to.strftime("%Y-%m-%d"),
-            "metrics": ["revenue", "ordered_units", "delivered_units"],
-            "dimension": ["sku"],
-            "limit": limit,
-            "offset": offset
-        }
-        try:
+def fetch_accruals_by_period(cid, key, d_from, d_to):
+    """Тянем начисления по дням через accrual/by-day"""
+    url = "https://api-seller.ozon.ru/v1/finance/accrual/by-day"
+    all_accruals = []
+    current = d_from
+    while current <= d_to:
+        last_id = ""
+        while True:
+            payload = {"date": current.strftime("%Y-%m-%d"), "last_id": last_id}
             r = ozon_post_with_retry(url, ozon_headers(cid, key), payload)
             if r.status_code != 200:
-                st.error(f"Озон analytics ошибка {r.status_code}: {r.text}")
+                st.warning(f"accrual/by-day {current}: {r.status_code} {r.text[:200]}")
                 break
-            data = r.json().get("result", {}).get("data", [])
-            if not data:
+            data = r.json()
+            accruals = data.get("accruals", [])
+            all_accruals.extend(accruals)
+            last_id = data.get("last_id") or ""
+            if not last_id or not accruals:
                 break
-            for item in data:
-                dims = item.get("dimensions", [])
-                mets = item.get("metrics", [])
-                if dims:
-                    all_rows.append({
-                        "sku": str(dims[0].get("id")),
-                        "name": dims[0].get("name"),
-                        "revenue": mets[0] if len(mets) > 0 else 0,
-                        "ordered_units": mets[1] if len(mets) > 1 else 0,
-                        "delivered_units": mets[2] if len(mets) > 2 else 0
-                    })
-            if len(data) < limit:
-                break
-            offset += limit
-            time.sleep(0.3)
-        except Exception as e:
-            st.error(f"Озон analytics упал: {e}")
-            break
-    df = pd.DataFrame(all_rows)
-    if not df.empty:
-        # Группируем на случай дублей
-        df = df.groupby(["sku", "name"], as_index=False).agg({
-            "revenue": "sum",
-            "ordered_units": "sum",
-            "delivered_units": "sum"
-        })
-    return df
+            time.sleep(0.4)
+        current += timedelta(days=1)
+        time.sleep(0.3)
+    return all_accruals
+
+def aggregate_by_sku(accruals, type_map):
+    """Агрегируем начисления по SKU"""
+    sku_data = defaultdict(lambda: defaultdict(float))
+    for acc in accruals:
+        # Пытаемся вытащить SKU и суммы из разных вложенных структур
+        posting = acc.get("posting") or {}
+        products = posting.get("products") or []
+        item_fees = acc.get("item_fees") or {}
+        fees = item_fees.get("fees") or []
+
+        # Если есть products
+        for prod in products:
+            sku = str(prod.get("sku") or "")
+            if not sku or sku == "0":
+                continue
+            # Выручка / продажа
+            sale = prod.get("sale_amount") or {}
+            if isinstance(sale, dict):
+                sku_data[sku]["revenue"] += float(sale.get("amount") or 0)
+            # Комиссия
+            comm = prod.get("sale_commission") or {}
+            if isinstance(comm, dict):
+                sku_data[sku]["ozon_reward"] += float(comm.get("amount") or 0)
+            # Баллы
+            bonus = prod.get("commission") or {}
+            if isinstance(bonus, dict):
+                b = bonus.get("bonus") or {}
+                if isinstance(b, dict):
+                    sku_data[sku]["discount_points"] += float(b.get("amount") or 0)
+
+        # item_fees
+        for fee_group in fees:
+            sku = str(fee_group.get("sku") or "")
+            if not sku:
+                continue
+            for f in fee_group.get("fees") or []:
+                type_id = f.get("type_id")
+                amount = float((f.get("accrued") or {}).get("amount") or 0)
+                name = type_map.get(type_id, "other").lower()
+                if "логист" in name or "delivery" in name:
+                    sku_data[sku]["logistics"] += amount
+                elif "эквайр" in name or "acquiring" in name:
+                    sku_data[sku]["acquiring"] += amount
+                elif "возврат" in name or "return" in name:
+                    sku_data[sku]["returns"] += amount
+                elif "реклам" in name or "promo" in name or "ad" in name:
+                    sku_data[sku]["ads"] += amount
+                else:
+                    sku_data[sku]["other_expenses"] += amount
+
+        # non_item_fee и прочее — в other
+        non_item = acc.get("non_item_fee") or {}
+        if non_item:
+            amount = float((non_item.get("accrued") or {}).get("amount") or 0)
+            # распределяем позже, пока в общий
+            sku_data["_non_item"]["other_expenses"] += amount
+
+    # Превращаем в DataFrame
+    rows = []
+    for sku, data in sku_data.items():
+        if sku == "_non_item":
+            continue
+        rows.append({"sku": sku, **data})
+    return pd.DataFrame(rows)
 
 @st.cache_data(ttl=600)
-def fetch_ozon_sku_to_offer(cid, key, skus):
-    """Тянем offer_id по списку SKU"""
+def fetch_sku_to_offer(cid, key, skus):
     if not skus:
         return pd.DataFrame()
     url = "https://api-seller.ozon.ru/v3/product/info/list"
     offer_map = {}
     for i in range(0, len(skus), 100):
-        chunk = skus[i:i+100]
-        payload = {"sku": [int(s) for s in chunk if str(s).isdigit()]}
-        try:
-            r = ozon_post_with_retry(url, ozon_headers(cid, key), payload)
-            if r.status_code == 200:
-                for item in r.json().get("items", []):
-                    sku = str(item.get("sku") or item.get("sources", [{}])[0].get("sku", ""))
-                    offer = item.get("offer_id")
-                    if sku and offer:
-                        offer_map[sku] = offer
-        except Exception:
-            pass
-        time.sleep(0.5)
-    return pd.DataFrame([{"sku": k, "offer_id": v} for k, v in offer_map.items()])
-
-@st.cache_data(ttl=600)
-def fetch_ozon_realization(cid, key, year, month):
-    """Отчёт реализации — там баллы за скидки"""
-    url = "https://api-seller.ozon.ru/v2/finance/realization"
-    payload = {"month": month, "year": year}
-    try:
+        chunk = [s for s in skus[i:i+100] if str(s).isdigit()]
+        if not chunk:
+            continue
+        payload = {"sku": [int(s) for s in chunk]}
         r = ozon_post_with_retry(url, ozon_headers(cid, key), payload)
-        if r.status_code != 200:
-            st.warning(f"Realization не отдался: {r.status_code} {r.text}")
-            return {}
-        return r.json().get("result", {})
-    except Exception as e:
-        st.warning(f"Realization не отдался: {e}")
-        return {}
-
-@st.cache_data(ttl=300)
-def fetch_ozon_transactions_old(cid, key, d_from, d_to):
-    """Старый метод (может быть уже мёртвый)"""
-    url = "https://api-seller.ozon.ru/v3/finance/transaction/list"
-    all_ops = []
-    page = 1
-    while page < 20:  # защита
-        payload = {
-            "filter": {
-                "date": {
-                    "from": d_from.strftime("%Y-%m-%dT00:00:00.000Z"),
-                    "to": d_to.strftime("%Y-%m-%dT23:59:59.999Z")
-                },
-                "transaction_type": "all"
-            },
-            "page": page,
-            "page_size": 1000
-        }
-        try:
-            r = ozon_post_with_retry(url, ozon_headers(cid, key), payload)
-            if r.status_code != 200:
-                break
-            ops = r.json().get("result", {}).get("operations", [])
-            if not ops:
-                break
-            all_ops.extend(ops)
-            if len(ops) < 1000:
-                break
-            page += 1
-            time.sleep(0.5)
-        except Exception:
-            break
-    return pd.DataFrame(all_ops) if all_ops else pd.DataFrame()
+        if r.status_code == 200:
+            for item in r.json().get("items", []):
+                sku = str(item.get("sku") or "")
+                offer = item.get("offer_id")
+                name = item.get("name")
+                if sku and offer:
+                    offer_map[sku] = {"offer_id": offer, "name": name}
+        time.sleep(0.4)
+    return pd.DataFrame([{"sku": k, **v} for k, v in offer_map.items()])
 
 @st.cache_data(ttl=600)
 def fetch_ms_costs(token):
-    """Только себестоимость + код из МоегоСклада"""
     url = "https://api.moysklad.ru/api/remap/1.2/report/stock/all"
     try:
         r = requests.get(url, headers=ms_headers(token), timeout=60)
@@ -189,12 +188,11 @@ def fetch_ms_costs(token):
         data = []
         for row in rows:
             code = row.get("code") or row.get("article")
-            price = row.get("price")  # в копейках
             if code:
                 data.append({
                     "ms_code": str(code).strip(),
                     "ms_name": row.get("name"),
-                    "cost_price": (price or 0) / 100.0,
+                    "cost_price": (row.get("price") or 0) / 100.0,
                     "stock": row.get("stock", 0)
                 })
         return pd.DataFrame(data)
@@ -204,149 +202,112 @@ def fetch_ms_costs(token):
 
 if run:
     if not all([ozon_client_id, ozon_api_key, ms_token]):
-        st.error("Ключи все вбей, иначе нехуй считать.")
+        st.error("Введи все ключи")
+        st.stop()
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    status.info("Загружаем справочник типов начислений...")
+    progress.progress(10)
+    type_map = fetch_accrual_types(ozon_client_id, ozon_api_key)
+
+    status.info("Тянем начисления с Озона по дням...")
+    progress.progress(25)
+    accruals = fetch_accruals_by_period(ozon_client_id, ozon_api_key, date_from, date_to)
+
+    if not accruals:
+        st.warning("Не удалось получить начисления. Проверь ключи и период.")
+        st.stop()
+
+    status.info("Агрегируем по SKU...")
+    progress.progress(50)
+    sku_df = aggregate_by_sku(accruals, type_map)
+
+    if sku_df.empty:
+        st.warning("Не удалось извлечь данные по SKU. Структура ответа может отличаться.")
+        st.stop()
+
+    status.info("Достаём артикулы и названия...")
+    progress.progress(65)
+    offers = fetch_sku_to_offer(ozon_client_id, ozon_api_key, sku_df["sku"].tolist())
+    if not offers.empty:
+        sku_df = sku_df.merge(offers, on="sku", how="left")
+
+    status.info("Себестоимость из МоегоСклада...")
+    progress.progress(80)
+    ms = fetch_ms_costs(ms_token)
+
+    status.info("Считаем прибыль...")
+    progress.progress(90)
+
+    if not ms.empty and "offer_id" in sku_df.columns:
+        merged = sku_df.merge(ms, left_on="offer_id", right_on="ms_code", how="left")
     else:
-        progress = st.progress(0)
-        status = st.empty()
+        merged = sku_df.copy()
+        merged["cost_price"] = 0
 
-        status.info("Тянем продажи с Озона...")
-        progress.progress(10)
-        ozon_sales = fetch_ozon_analytics(ozon_client_id, ozon_api_key, date_from, date_to)
+    # Заполняем нули
+    for col in ["revenue", "ozon_reward", "discount_points", "logistics", "acquiring", "returns", "ads", "other_expenses", "cost_price"]:
+        if col not in merged.columns:
+            merged[col] = 0
+        merged[col] = merged[col].fillna(0)
 
-        if ozon_sales.empty:
-            st.warning("Озон не вернул продаж. Смотри ошибку выше и проверь ключи/период.")
-            st.stop()
+    # Прибыль = выручка + баллы - вознаграждение - расходы - себестоимость
+    # (упрощённо, без количества штук пока)
+    merged["total_expenses"] = (
+        merged["ozon_reward"] + merged["logistics"] + merged["acquiring"] +
+        merged["returns"] + merged["ads"] + merged["other_expenses"]
+    )
+    merged["profit"] = merged["revenue"] + merged["discount_points"] - merged["total_expenses"] - merged["cost_price"]
+    merged["margin_pct"] = (merged["profit"] / merged["revenue"].replace(0, pd.NA) * 100).fillna(0).round(1)
 
-        status.info("Достаём артикулы (offer_id)...")
-        progress.progress(25)
-        if not ozon_sales.empty:
-            sku_offer = fetch_ozon_sku_to_offer(ozon_client_id, ozon_api_key, ozon_sales["sku"].unique().tolist())
-            if not sku_offer.empty:
-                ozon_sales = ozon_sales.merge(sku_offer, on="sku", how="left")
-            else:
-                ozon_sales["offer_id"] = None
-        else:
-            ozon_sales["offer_id"] = None
+    progress.progress(100)
+    status.success("Готово")
 
-        status.info("Тянем расходы и баллы с Озона (realization + транзакции)...")
-        progress.progress(45)
-        # Realization за месяц (берём месяц date_to)
-        real = fetch_ozon_realization(ozon_client_id, ozon_api_key, date_to.year, date_to.month)
-        transactions = fetch_ozon_transactions_old(ozon_client_id, ozon_api_key, date_from, date_to)
+    # Метрики
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Выручка", f"{merged['revenue'].sum():,.0f} ₽")
+    c2.metric("Расходы Ozon", f"{merged['total_expenses'].sum():,.0f} ₽")
+    c3.metric("Себестоимость", f"{merged['cost_price'].sum():,.0f} ₽")
+    c4.metric("Прибыль", f"{merged['profit'].sum():,.0f} ₽")
 
-        status.info("Себестоимость из МоегоСклада...")
-        progress.progress(70)
-        ms_costs = fetch_ms_costs(ms_token)
+    st.subheader("Позиции")
+    display_cols = ["sku", "offer_id", "name", "revenue", "discount_points", "ozon_reward", "logistics", "acquiring", "returns", "ads", "other_expenses", "cost_price", "profit", "margin_pct", "ms_name"]
+    display_cols = [c for c in display_cols if c in merged.columns]
 
-        status.info("Склеиваем и считаем...")
-        progress.progress(90)
+    col_names = {
+        "sku": "SKU",
+        "offer_id": "Артикул",
+        "name": "Название",
+        "revenue": "Выручка",
+        "discount_points": "Баллы за скидки",
+        "ozon_reward": "Вознаграждение Ozon",
+        "logistics": "Логистика",
+        "acquiring": "Эквайринг",
+        "returns": "Возвраты",
+        "ads": "Реклама",
+        "other_expenses": "Прочие расходы",
+        "cost_price": "Себестоимость",
+        "profit": "Прибыль",
+        "margin_pct": "Маржа %",
+        "ms_name": "Название МС"
+    }
+    display_df = merged[display_cols].rename(columns=col_names).sort_values("Выручка", ascending=False)
 
-        # Сводка
-        total_revenue = ozon_sales["revenue"].sum() if not ozon_sales.empty else 0
-        total_ordered = ozon_sales["ordered_units"].sum() if not ozon_sales.empty else 0
-        total_delivered = ozon_sales["delivered_units"].sum() if not ozon_sales.empty else 0
+    st.dataframe(display_df, use_container_width=True, height=600)
 
-        # Баллы из realization (может не работать)
-        bonus_points = 0
-        if isinstance(real, dict) and real:
-            rows = real.get("rows") or real.get("items") or []
-            for row in rows:
-                try:
-                    bonus_points += float(row.get("bonus") or row.get("points_for_discounts") or 0)
-                except (TypeError, ValueError):
-                    pass
+    st.download_button(
+        "📥 Скачать CSV",
+        display_df.to_csv(index=False).encode("utf-8-sig"),
+        "unit_economics.csv",
+        "text/csv"
+    )
 
-        # Расходы из транзакций (amount отрицательные)
-        total_expenses = 0
-        if not transactions.empty and "amount" in transactions.columns:
-            total_expenses = transactions["amount"].sum()  # обычно отрицательное
-
-        # Матчинг и прибыль по товарам
-        if not ozon_sales.empty and not ms_costs.empty:
-            merged = ozon_sales.merge(
-                ms_costs,
-                left_on="offer_id",
-                right_on="ms_code",
-                how="left"
-            )
-            # Себестоимость считаем по доставленным, если есть, иначе по заказанным
-            units_for_cost = merged["delivered_units"].fillna(merged["ordered_units"]).fillna(0)
-            merged["cost_total"] = merged["cost_price"].fillna(0) * units_for_cost
-            merged["gross_profit"] = merged["revenue"].fillna(0) - merged["cost_total"]
-            # Безопасный расчёт маржи
-            def calc_margin(row):
-                rev = row["revenue"] or 0
-                if rev == 0:
-                    return 0.0
-                return round(row["gross_profit"] / rev * 100, 1)
-            merged["margin_pct"] = merged.apply(calc_margin, axis=1)
-        else:
-            merged = ozon_sales.copy()
-            merged["cost_price"] = 0
-            merged["cost_total"] = 0
-            merged["gross_profit"] = merged.get("revenue", 0)
-            merged["margin_pct"] = 0
-
-        progress.progress(100)
-        status.success("Готово. Смотри цифры, не обосрись.")
-
-        # === Метрики ===
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Выручка Ozon", f"{total_revenue:,.0f} ₽")
-        c2.metric("Заказано, шт", f"{total_ordered:,.0f}")
-        c3.metric("Доставлено, шт", f"{total_delivered:,.0f}")
-        c4.metric("Себестоимость (МС)", f"{merged['cost_total'].sum():,.0f} ₽")
-        c5.metric("Грубая прибыль", f"{merged['gross_profit'].sum():,.0f} ₽")
-
-        st.subheader("Товары (матчинг артикул Озона = код МС)")
-        display_cols = ["offer_id", "name", "sku", "revenue", "ordered_units", "delivered_units", "cost_price", "cost_total", "gross_profit", "margin_pct", "ms_name", "stock"]
-        display_cols = [c for c in display_cols if c in merged.columns]
-        
-        col_names = {
-            "offer_id": "Артикул",
-            "name": "Название (Ozon)",
-            "sku": "SKU",
-            "revenue": "Выручка",
-            "ordered_units": "Заказано, шт",
-            "delivered_units": "Доставлено, шт",
-            "cost_price": "Себестоимость за шт",
-            "cost_total": "Себестоимость итого",
-            "gross_profit": "Валовая прибыль",
-            "margin_pct": "Маржа, %",
-            "ms_name": "Название (МС)",
-            "stock": "Остаток"
-        }
-        display_df = merged[display_cols].rename(columns=col_names).sort_values("Выручка", ascending=False)
-        
-        st.dataframe(
-            display_df,
-            use_container_width=True,
-            height=500
-        )
-
-        if not transactions.empty:
-            st.subheader("Финансовые операции Ozon (старый метод, может быть пусто)")
-            st.dataframe(transactions.head(200), use_container_width=True)
-
-        if real:
-            with st.expander("Сырой realization (там баллы)"):
-                st.json(real)
-
-        st.download_button(
-            "📥 Скачать CSV",
-            display_df.to_csv(index=False).encode("utf-8-sig"),
-            "ozon_ms_profit.csv",
-            "text/csv"
-        )
+    with st.expander("Сырые начисления (для отладки)"):
+        st.write(f"Всего записей: {len(accruals)}")
+        if accruals:
+            st.json(accruals[:3])
 
 st.markdown("---")
-st.caption("""
-**Что считается:**
-- Выручка, заказано и доставлено — analytics/data (с пагинацией)
-- Артикул — offer_id из product/info/list
-- Себестоимость — report/stock/all из МоегоСклада (price/100)
-- Баллы за скидки — из realization (поле bonus)
-- Расходы — из транзакций (amount), если метод ещё жив
-
-Прибыль = выручка − себестоимость (по доставленным штукам). Комиссии/логистика пока в общей сумме расходов, не раскиданы по SKU.
-""")
+st.caption("Цифры могут не совпадать на 100% с кабинетом — структура новых методов сложная. Если что-то не так, скинь сырые данные.")
