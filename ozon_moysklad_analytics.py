@@ -8,7 +8,7 @@ from collections import defaultdict
 st.set_page_config(page_title="Ozon + МойСклад — Юнит-экономика", layout="wide", page_icon="📊")
 
 st.title("📊 Юнит-экономика: Ozon + МойСклад")
-st.caption("Итого Ozon из total_amount. Себестоимость из приёмок и оприходований.")
+st.caption("Логистика считается только из delivery.services. Итого Ozon из total_amount.")
 
 def get_secret(key, default=""):
     try:
@@ -91,11 +91,12 @@ def fetch_accruals_by_period(cid, key, d_from, d_to):
 
 def categorize_type(type_id, type_map):
     name = type_map.get(type_id, "")
-    if any(x in name for x in ["логист", "delivery", "магистр", "последн"]):
+    # Более строгая категоризация логистики
+    if any(x in name for x in ["логистика", "delivery", "магистральная", "последняя миля"]):
         return "logistics"
-    if any(x in name for x in ["эквайр", "acquiring"]):
+    if any(x in name for x in ["эквайринг", "acquiring"]):
         return "acquiring"
-    if any(x in name for x in ["возврат", "return", "обратн"]):
+    if any(x in name for x in ["возврат", "return", "обратная логистика"]):
         return "returns"
     if any(x in name for x in ["реклам", "promo", "клик", "заказ", "звёзд", "бренд"]):
         return "ads"
@@ -154,13 +155,18 @@ def aggregate_by_sku(accruals, type_map):
                 if isinstance(sale_comm, dict):
                     sku_data[sku]["ozon_reward"] += float(sale_comm.get("amount") or 0)
 
+            # Логистика только из delivery.services (не из item_fees)
             delivery = prod.get("delivery") or {}
             for svc in delivery.get("services") or []:
                 type_id = svc.get("type_id")
                 amount = float((svc.get("accrued") or {}).get("amount") or 0)
                 cat = categorize_type(type_id, type_map)
-                sku_data[sku][cat] += amount
+                if cat == "logistics":
+                    sku_data[sku]["logistics"] += amount
+                else:
+                    sku_data[sku][cat] += amount
 
+        # item_fees — только не-логистика, чтобы не дублировать
         for fee_group in item_fees.get("fees") or []:
             sku = str(fee_group.get("sku") or "")
             if not sku:
@@ -169,7 +175,8 @@ def aggregate_by_sku(accruals, type_map):
                 type_id = f.get("type_id")
                 amount = float((f.get("accrued") or {}).get("amount") or 0)
                 cat = categorize_type(type_id, type_map)
-                sku_data[sku][cat] += amount
+                if cat != "logistics":  # логистику уже взяли из delivery
+                    sku_data[sku][cat] += amount
 
     rows = [{"sku": sku, **dict(data)} for sku, data in sku_data.items() if sku != "_shared"]
     shared = sku_data.get("_shared", {}).get("ozon_net_raw", 0)
@@ -327,7 +334,7 @@ if run:
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Выручка", f"{merged['revenue'].sum():,.0f} ₽")
     c2.metric("Баллы + Партнёры", f"{(merged['discount_points'] + merged['partner_programs']).sum():,.0f} ₽")
-    c3.metric("Продажи", f"{merged['sales'].sum():,.0f} ₽")
+    c3.metric("Логистика", f"{merged['logistics'].sum():,.0f} ₽")
     c4.metric("Итого Ozon", f"{merged['ozon_net'].sum():,.0f} ₽")
     c5.metric("Себестоимость", f"{merged['cost_total'].sum():,.0f} ₽")
     c6.metric("Прибыль / Маржа", f"{merged['profit'].sum():,.0f} ₽ / {overall_margin:.1f}%")
@@ -336,7 +343,7 @@ if run:
 
     display_cols = [
         "sku", "offer_id", "name", "qty",
-        "revenue", "discount_points", "partner_programs", "sales",
+        "revenue", "discount_points", "partner_programs",
         "ozon_reward", "logistics", "acquiring", "returns",
         "ozon_net",
         "cost_total", "profit", "margin_pct"
@@ -351,7 +358,6 @@ if run:
         "revenue": "Выручка",
         "discount_points": "Баллы",
         "partner_programs": "Партнёры",
-        "sales": "Продажи",
         "ozon_reward": "Вознаграждение",
         "logistics": "Логистика",
         "acquiring": "Эквайринг",
@@ -380,4 +386,4 @@ if run:
             st.caption(f"Найдено позиций: {len(low_margin)}")
 
 st.markdown("---")
-st.caption("Вкладка «Маржа < 20%» — товары, которые можно поднять в цене или убрать из продаж.")
+st.caption("Логистика теперь только из delivery.services, без дублей из item_fees.")
