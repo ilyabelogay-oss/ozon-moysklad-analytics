@@ -8,7 +8,7 @@ from collections import defaultdict
 st.set_page_config(page_title="Ozon + МойСклад — Юнит-экономика", layout="wide", page_icon="📊")
 
 st.title("📊 Юнит-экономика: Ozon + МойСклад")
-st.caption("Начисления с Озона + себестоимость из МС.")
+st.caption("Блоки: Продажи → Начисления → Итого Ozon − Себестоимость = Прибыль")
 
 def get_secret(key, default=""):
     try:
@@ -241,29 +241,56 @@ if run:
             merged[col] = 0.0
         merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0)
 
-    merged["sales_total"] = merged["revenue"] + merged["discount_points"] + merged["partner_programs"]
-    merged["accruals_total"] = (
-        merged["ozon_reward"] + merged["logistics"] + merged["acquiring"] +
-        merged["returns"] + merged["ads"] + merged["other_expenses"]
+    # Блок 1: Продажи
+    merged["sales"] = (
+        merged["revenue"]
+        + merged["partner_programs"]
+        + merged["discount_points"]
+        - merged["returns"].abs()   # возвраты вычитаем по модулю
     )
-    merged["ozon_net"] = merged["sales_total"] + merged["accruals_total"]
+
+    # Блок 2: Начисления (все остальное с знаками)
+    merged["accruals"] = (
+        merged["ozon_reward"]
+        + merged["logistics"]
+        + merged["acquiring"]
+        + merged["ads"]
+        + merged["other_expenses"]
+    )
+
+    # Итого от Ozon
+    merged["ozon_net"] = merged["sales"] + merged["accruals"]
+
+    # Себестоимость
     merged["cost_total"] = merged["cost_price"] * merged["qty"]
+
+    # Прибыль
     merged["profit"] = merged["ozon_net"] - merged["cost_total"]
     merged["margin_pct"] = (merged["profit"] / merged["revenue"].replace(0, pd.NA) * 100).fillna(0).round(1)
 
     progress.progress(100)
     status.success("Готово")
 
-    st.info(f"Сырой итог всех total_amount из API: {raw_total:,.0f} ₽ (должен быть близко к «Итого» в кабинете)")
+    st.info(f"Сырой итог total_amount из API: {raw_total:,.0f} ₽")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Выручка", f"{merged['revenue'].sum():,.0f} ₽")
-    c2.metric("Итого от Ozon", f"{merged['ozon_net'].sum():,.0f} ₽")
-    c3.metric("Себестоимость", f"{merged['cost_total'].sum():,.0f} ₽")
-    c4.metric("Прибыль", f"{merged['profit'].sum():,.0f} ₽")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Продажи", f"{merged['sales'].sum():,.0f} ₽")
+    c2.metric("Начисления", f"{merged['accruals'].sum():,.0f} ₽")
+    c3.metric("Итого Ozon", f"{merged['ozon_net'].sum():,.0f} ₽")
+    c4.metric("Себестоимость", f"{merged['cost_total'].sum():,.0f} ₽")
+    c5.metric("Прибыль", f"{merged['profit'].sum():,.0f} ₽")
 
     st.subheader("Позиции")
-    display_cols = ["sku", "offer_id", "name", "qty", "revenue", "discount_points", "partner_programs", "ozon_reward", "logistics", "acquiring", "returns", "ads", "other_expenses", "ozon_net", "cost_total", "profit", "margin_pct"]
+    display_cols = [
+        "sku", "offer_id", "name", "qty",
+        "revenue", "partner_programs", "discount_points", "returns",
+        "sales",
+        "ozon_reward", "logistics", "acquiring", "ads", "other_expenses",
+        "accruals",
+        "ozon_net",
+        "cost_total",
+        "profit", "margin_pct"
+    ]
     display_cols = [c for c in display_cols if c in merged.columns]
 
     col_names = {
@@ -272,14 +299,16 @@ if run:
         "name": "Название",
         "qty": "Шт",
         "revenue": "Выручка",
-        "discount_points": "Баллы",
         "partner_programs": "Партнёры",
+        "discount_points": "Баллы",
+        "returns": "Возвраты",
+        "sales": "Продажи",
         "ozon_reward": "Вознаграждение",
         "logistics": "Логистика",
         "acquiring": "Эквайринг",
-        "returns": "Возвраты",
         "ads": "Реклама",
         "other_expenses": "Прочие",
+        "accruals": "Начисления",
         "ozon_net": "Итого Ozon",
         "cost_total": "Себестоимость",
         "profit": "Прибыль",
@@ -287,9 +316,9 @@ if run:
     }
     display_df = merged[display_cols].rename(columns=col_names).sort_values("Выручка", ascending=False)
 
-    st.dataframe(display_df, use_container_width=True, height=600)
+    st.dataframe(display_df, use_container_width=True, height=650)
 
     st.download_button("📥 CSV", display_df.to_csv(index=False).encode("utf-8-sig"), "unit_economics.csv", "text/csv")
 
 st.markdown("---")
-st.caption("Итого Ozon = выручка + баллы + партнёры + все начисления. Прибыль = Итого Ozon − себестоимость. Сырой итог — для сверки с кабинетом.")
+st.caption("Продажи = Выручка + Партнёры + Баллы − Возвраты. Начисления = всё остальное. Итого Ozon = Продажи + Начисления. Прибыль = Итого Ozon − Себестоимость.")
