@@ -8,7 +8,7 @@ from collections import defaultdict
 st.set_page_config(page_title="Ozon + МойСклад — Юнит-экономика", layout="wide", page_icon="📊")
 
 st.title("📊 Юнит-экономика: Ozon + МойСклад")
-st.caption("Возвраты ищутся шире. Логистика из delivery.total_accrued.")
+st.caption("Возвраты ловятся шире (отрицательная выручка + категория).")
 
 def get_secret(key, default=""):
     try:
@@ -135,18 +135,22 @@ def aggregate_by_sku(accruals, type_map):
                 continue
 
             qty = float(prod.get("quantity") or 0)
-            # Если количество отрицательное — это возврат
             if qty < 0:
-                sku_data[sku]["returns"] += abs(qty)  # штуки возврата
+                sku_data[sku]["returns"] += abs(qty)
                 returns_debug.append({"sku": sku, "qty": qty, "source": "negative_qty"})
 
             comm = prod.get("commission")
             if isinstance(comm, dict):
                 sale_amt = comm.get("sale_amount") or {}
                 sale_val = float(sale_amt.get("amount") or 0) if isinstance(sale_amt, dict) else 0
+
                 if sale_val > 0:
                     sku_data[sku]["revenue"] += sale_val
                     sku_data[sku]["qty"] += qty if qty > 0 else 0
+                elif sale_val < 0:
+                    # Отрицательная выручка = возврат
+                    sku_data[sku]["returns"] += abs(sale_val)
+                    returns_debug.append({"sku": sku, "amount": sale_val, "source": "negative_sale"})
 
                 bonus = comm.get("bonus") or {}
                 if isinstance(bonus, dict):
@@ -166,7 +170,6 @@ def aggregate_by_sku(accruals, type_map):
                 log_amt = float(total_acc.get("amount") or 0)
                 sku_data[sku]["logistics"] += log_amt
 
-        # item_fees
         for fee_group in item_fees.get("fees") or []:
             sku = str(fee_group.get("sku") or "")
             if not sku:
@@ -179,11 +182,10 @@ def aggregate_by_sku(accruals, type_map):
                 if cat == "returns":
                     returns_debug.append({"sku": sku, "amount": amount, "type_id": type_id, "source": "item_fees"})
 
-        # Если категория начисления содержит RETURN
         if "RETURN" in category and skus_in_acc:
             for sku in set(skus_in_acc):
                 sku_data[sku]["returns"] += abs(total_amt)
-                returns_debug.append({"sku": sku, "amount": total_amt, "source": "category"})
+                returns_debug.append({"sku": sku, "amount": total_amt, "source": "category_RETURN"})
 
     rows = [{"sku": sku, **dict(data)} for sku, data in sku_data.items() if sku != "_shared"]
     shared = sku_data.get("_shared", {}).get("ozon_net_raw", 0)
@@ -311,7 +313,7 @@ if run:
     with st.expander("Отладка возвратов"):
         st.write(f"Найдено записей возвратов: {len(returns_debug)}")
         if returns_debug:
-            st.json(returns_debug[:20])
+            st.json(returns_debug[:30])
 
     if not ms.empty and "offer_id" in sku_df.columns:
         merged = sku_df.merge(ms, left_on="offer_id", right_on="ms_code", how="left")
@@ -324,10 +326,10 @@ if run:
             merged[col] = 0.0
         merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0)
 
-    merged["sales"] = merged["revenue"] + merged["discount_points"] + merged["partner_programs"]
+    merged["sales"] = merged["revenue"] + merged["discount_points"] + merged["partner_programs"] - merged["returns"]
     merged["expenses"] = (
         merged["ozon_reward"] + merged["logistics"] + merged["acquiring"] +
-        merged["returns"] + merged["ads"] + merged["other_expenses"]
+        merged["ads"] + merged["other_expenses"]
     )
     merged["ozon_net"] = merged["ozon_net_raw"]
     merged["cost_total"] = merged["cost_price"] * merged["qty"]
@@ -355,8 +357,8 @@ if run:
 
     display_cols = [
         "sku", "offer_id", "name", "qty",
-        "revenue", "discount_points", "partner_programs",
-        "ozon_reward", "logistics", "acquiring", "returns",
+        "revenue", "discount_points", "partner_programs", "returns",
+        "ozon_reward", "logistics", "acquiring",
         "ozon_net",
         "cost_total", "profit", "margin_pct"
     ]
@@ -370,10 +372,10 @@ if run:
         "revenue": "Выручка",
         "discount_points": "Баллы",
         "partner_programs": "Партнёры",
+        "returns": "Возвраты",
         "ozon_reward": "Вознаграждение",
         "logistics": "Логистика",
         "acquiring": "Эквайринг",
-        "returns": "Возвраты",
         "ozon_net": "Итого Ozon",
         "cost_total": "Себестоимость",
         "profit": "Прибыль",
@@ -398,4 +400,4 @@ if run:
             st.caption(f"Найдено позиций: {len(low_margin)}")
 
 st.markdown("---")
-st.caption("Смотри отладку возвратов — там видно, нашлось ли что-то.")
+st.caption("Возвраты теперь вычитаются из Продаж. Смотри отладку.")
