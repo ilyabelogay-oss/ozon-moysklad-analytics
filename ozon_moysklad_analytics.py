@@ -8,7 +8,7 @@ from collections import defaultdict
 st.set_page_config(page_title="Ozon + МойСклад — Юнит-экономика", layout="wide", page_icon="📊")
 
 st.title("📊 Юнит-экономика: Ozon + МойСклад")
-st.caption("Логистика считается только из delivery.services. Итого Ozon из total_amount.")
+st.caption("Логистика из delivery.total_accrued. Итого Ozon из total_amount.")
 
 def get_secret(key, default=""):
     try:
@@ -91,9 +91,6 @@ def fetch_accruals_by_period(cid, key, d_from, d_to):
 
 def categorize_type(type_id, type_map):
     name = type_map.get(type_id, "")
-    # Более строгая категоризация логистики
-    if any(x in name for x in ["логистика", "delivery", "магистральная", "последняя миля"]):
-        return "logistics"
     if any(x in name for x in ["эквайринг", "acquiring"]):
         return "acquiring"
     if any(x in name for x in ["возврат", "return", "обратная логистика"]):
@@ -155,18 +152,14 @@ def aggregate_by_sku(accruals, type_map):
                 if isinstance(sale_comm, dict):
                     sku_data[sku]["ozon_reward"] += float(sale_comm.get("amount") or 0)
 
-            # Логистика только из delivery.services (не из item_fees)
+            # Логистика из delivery.total_accrued
             delivery = prod.get("delivery") or {}
-            for svc in delivery.get("services") or []:
-                type_id = svc.get("type_id")
-                amount = float((svc.get("accrued") or {}).get("amount") or 0)
-                cat = categorize_type(type_id, type_map)
-                if cat == "logistics":
-                    sku_data[sku]["logistics"] += amount
-                else:
-                    sku_data[sku][cat] += amount
+            total_acc = delivery.get("total_accrued") or {}
+            if isinstance(total_acc, dict):
+                log_amt = float(total_acc.get("amount") or 0)
+                sku_data[sku]["logistics"] += log_amt
 
-        # item_fees — только не-логистика, чтобы не дублировать
+        # item_fees — остальные расходы (не логистика)
         for fee_group in item_fees.get("fees") or []:
             sku = str(fee_group.get("sku") or "")
             if not sku:
@@ -175,8 +168,7 @@ def aggregate_by_sku(accruals, type_map):
                 type_id = f.get("type_id")
                 amount = float((f.get("accrued") or {}).get("amount") or 0)
                 cat = categorize_type(type_id, type_map)
-                if cat != "logistics":  # логистику уже взяли из delivery
-                    sku_data[sku][cat] += amount
+                sku_data[sku][cat] += amount
 
     rows = [{"sku": sku, **dict(data)} for sku, data in sku_data.items() if sku != "_shared"]
     shared = sku_data.get("_shared", {}).get("ozon_net_raw", 0)
@@ -386,4 +378,4 @@ if run:
             st.caption(f"Найдено позиций: {len(low_margin)}")
 
 st.markdown("---")
-st.caption("Логистика теперь только из delivery.services, без дублей из item_fees.")
+st.caption("Логистика теперь из delivery.total_accrued (агрегированная сумма по позиции).")
