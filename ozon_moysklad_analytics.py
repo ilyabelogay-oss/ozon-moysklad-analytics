@@ -8,7 +8,7 @@ from collections import defaultdict
 st.set_page_config(page_title="Ozon + МойСклад — Юнит-экономика", layout="wide", page_icon="📊")
 
 st.title("📊 Юнит-экономика: Ozon + МойСклад")
-st.caption("Продажи считаются без дублей. Итого Ozon из total_amount.")
+st.caption("Итого Ozon из total_amount. Себестоимость из приёмок и оприходований.")
 
 def get_secret(key, default=""):
     try:
@@ -305,15 +305,11 @@ if run:
             merged[col] = 0.0
         merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0)
 
-    # Продажи без дублей: выручка + баллы + партнёры
-    # (баллы и партнёры уже в комиссии, не дублируем выручку)
     merged["sales"] = merged["revenue"] + merged["discount_points"] + merged["partner_programs"]
-
     merged["expenses"] = (
         merged["ozon_reward"] + merged["logistics"] + merged["acquiring"] +
         merged["returns"] + merged["ads"] + merged["other_expenses"]
     )
-
     merged["ozon_net"] = merged["ozon_net_raw"]
     merged["cost_total"] = merged["cost_price"] * merged["qty"]
     merged["profit"] = merged["ozon_net"] - merged["cost_total"]
@@ -336,7 +332,8 @@ if run:
     c5.metric("Себестоимость", f"{merged['cost_total'].sum():,.0f} ₽")
     c6.metric("Прибыль / Маржа", f"{merged['profit'].sum():,.0f} ₽ / {overall_margin:.1f}%")
 
-    st.subheader("Позиции")
+    tab1, tab2 = st.tabs(["Все позиции", "Маржа < 20%"])
+
     display_cols = [
         "sku", "offer_id", "name", "qty",
         "revenue", "discount_points", "partner_programs", "sales",
@@ -364,11 +361,23 @@ if run:
         "profit": "Прибыль",
         "margin_pct": "Маржа %"
     }
-    display_df = merged[display_cols].rename(columns=col_names).sort_values("Итого Ozon", ascending=False)
 
-    st.dataframe(display_df, use_container_width=True, height=650)
+    with tab1:
+        st.subheader("Все позиции")
+        display_df = merged[display_cols].rename(columns=col_names).sort_values("Итого Ozon", ascending=False)
+        st.dataframe(display_df, use_container_width=True, height=650)
+        st.download_button("📥 CSV все", display_df.to_csv(index=False).encode("utf-8-sig"), "all_positions.csv", "text/csv")
 
-    st.download_button("📥 CSV", display_df.to_csv(index=False).encode("utf-8-sig"), "unit_economics.csv", "text/csv")
+    with tab2:
+        st.subheader("Товары с маржой ниже 20%")
+        low_margin = merged[merged["margin_pct"] < 20].copy()
+        if low_margin.empty:
+            st.info("Нет товаров с маржой ниже 20%")
+        else:
+            low_df = low_margin[display_cols].rename(columns=col_names).sort_values("Маржа %")
+            st.dataframe(low_df, use_container_width=True, height=650)
+            st.download_button("📥 CSV низкая маржа", low_df.to_csv(index=False).encode("utf-8-sig"), "low_margin.csv", "text/csv")
+            st.caption(f"Найдено позиций: {len(low_margin)}")
 
 st.markdown("---")
-st.caption("Продажи = Выручка + Баллы + Партнёры. Итого Ozon и Прибыль от total_amount.")
+st.caption("Вкладка «Маржа < 20%» — товары, которые можно поднять в цене или убрать из продаж.")
