@@ -8,7 +8,7 @@ from collections import defaultdict
 st.set_page_config(page_title="Ozon + МойСклад — Юнит-экономика", layout="wide", page_icon="📊")
 
 st.title("📊 Юнит-экономика: Ozon + МойСклад")
-st.caption("Начисления с Озона + себестоимость из МС. Выручка дублируется из analytics, если в accrual не нашлась.")
+st.caption("Начисления с Озона + себестоимость из МС. Выручка из analytics, расходы из accrual.")
 
 def get_secret(key, default=""):
     try:
@@ -155,7 +155,12 @@ def categorize_type(type_id, type_map):
 def aggregate_by_sku(accruals, type_map):
     sku_data = defaultdict(lambda: defaultdict(float))
     type_stats = defaultdict(float)
+    positive_samples = []
     for acc in accruals:
+        total_amt = float((acc.get("total_amount") or {}).get("amount") or 0)
+        if total_amt > 100 and len(positive_samples) < 5:
+            positive_samples.append(acc)
+
         posting = acc.get("posting") or {}
         for prod in posting.get("products") or []:
             sku = str(prod.get("sku") or "")
@@ -193,7 +198,7 @@ def aggregate_by_sku(accruals, type_map):
                 type_stats[f"{type_id}:{type_map.get(type_id, '?')}"] += amount
 
     rows = [{"sku": sku, **dict(data)} for sku, data in sku_data.items()]
-    return pd.DataFrame(rows), type_stats
+    return pd.DataFrame(rows), type_stats, positive_samples
 
 @st.cache_data(ttl=600)
 def fetch_sku_to_offer(cid, key, skus):
@@ -261,7 +266,7 @@ if run:
 
     status.info("Агрегация...")
     progress.progress(60)
-    sku_df, type_stats = aggregate_by_sku(accruals, type_map)
+    sku_df, type_stats, positive_samples = aggregate_by_sku(accruals, type_map)
 
     if not analytics.empty:
         if sku_df.empty:
@@ -348,12 +353,12 @@ if run:
     st.download_button("📥 CSV", display_df.to_csv(index=False).encode("utf-8-sig"), "unit_economics.csv", "text/csv")
 
     with st.expander("Отладка: типы начислений (суммы)"):
-        st.write("Топ типов по сумме (поможет понять, где выручка):")
-        sorted_types = sorted(type_stats.items(), key=lambda x: abs(x[1]), reverse=True)[:30]
+        sorted_types = sorted(type_stats.items(), key=lambda x: abs(x[1]), reverse=True)[:40]
         st.dataframe(pd.DataFrame(sorted_types, columns=["type_id:name", "sum"]))
 
-    with st.expander("Сырые начисления"):
-        st.json(accruals[:3] if accruals else [])
+    with st.expander("Примеры положительных начислений (где выручка)"):
+        st.write(f"Найдено положительных: {len(positive_samples)}")
+        st.json(positive_samples)
 
 st.markdown("---")
-st.caption("Выручка берётся из analytics, если в accrual её нет. Смотри отладку типов — там видно, какие type_id дают положительные суммы.")
+st.caption("Смотри примеры положительных начислений — там должна быть выручка и баллы.")
