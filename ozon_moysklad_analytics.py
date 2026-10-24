@@ -8,7 +8,7 @@ from collections import defaultdict
 st.set_page_config(page_title="Ozon + МойСклад — Юнит-экономика", layout="wide", page_icon="📊")
 
 st.title("📊 Юнит-экономика: Ozon + МойСклад")
-st.caption("Блоки: Продажи → Начисления → Итого Ozon − Себестоимость = Прибыль")
+st.caption("Итого Ozon берётся из total_amount (совпадает с кабинетом). Блоки — для детализации.")
 
 def get_secret(key, default=""):
     try:
@@ -104,15 +104,39 @@ def categorize_type(type_id, type_map):
 def aggregate_by_sku(accruals, type_map):
     sku_data = defaultdict(lambda: defaultdict(float))
     raw_total = 0.0
-    for acc in accruals:
-        raw_total += float((acc.get("total_amount") or {}).get("amount") or 0)
 
+    for acc in accruals:
+        total_amt = float((acc.get("total_amount") or {}).get("amount") or 0)
+        raw_total += total_amt
+
+        # Определяем SKU для этого начисления
+        skus_in_acc = []
         posting = acc.get("posting") or {}
+        for prod in posting.get("products") or []:
+            sku = str(prod.get("sku") or "")
+            if sku and sku != "0":
+                skus_in_acc.append(sku)
+
+        item_fees = acc.get("item_fees") or {}
+        for fee_group in item_fees.get("fees") or []:
+            sku = str(fee_group.get("sku") or "")
+            if sku:
+                skus_in_acc.append(sku)
+
+        # Если есть SKU — распределяем total_amount по ним (просто поровну, если несколько)
+        if skus_in_acc:
+            share = total_amt / len(set(skus_in_acc))
+            for sku in set(skus_in_acc):
+                sku_data[sku]["ozon_net_raw"] += share
+        else:
+            # Не привязано к SKU — в общий котёл
+            sku_data["_shared"]["ozon_net_raw"] += total_amt
+
+        # Детальные компоненты (для разбивки)
         for prod in posting.get("products") or []:
             sku = str(prod.get("sku") or "")
             if not sku or sku == "0":
                 continue
-
             qty = float(prod.get("quantity") or 1)
             sku_data[sku]["qty"] += qty
 
@@ -138,7 +162,6 @@ def aggregate_by_sku(accruals, type_map):
                 cat = categorize_type(type_id, type_map)
                 sku_data[sku][cat] += amount
 
-        item_fees = acc.get("item_fees") or {}
         for fee_group in item_fees.get("fees") or []:
             sku = str(fee_group.get("sku") or "")
             if not sku:
@@ -149,8 +172,9 @@ def aggregate_by_sku(accruals, type_map):
                 cat = categorize_type(type_id, type_map)
                 sku_data[sku][cat] += amount
 
-    rows = [{"sku": sku, **dict(data)} for sku, data in sku_data.items()]
-    return pd.DataFrame(rows), raw_total
+    rows = [{"sku": sku, **dict(data)} for sku, data in sku_data.items() if sku != "_shared"]
+    shared = sku_data.get("_shared", {}).get("ozon_net_raw", 0)
+    return pd.DataFrame(rows), raw_total, shared
 
 @st.cache_data(ttl=600)
 def fetch_sku_to_offer(cid, key, skus):
@@ -214,7 +238,7 @@ if run:
 
     status.info("Агрегация по SKU...")
     progress.progress(60)
-    sku_df, raw_total = aggregate_by_sku(accruals, type_map)
+    sku_df, raw_total, shared = aggregate_by_sku(accruals, type_map)
 
     if sku_df.empty:
         st.warning("Не удалось собрать данные")
@@ -236,60 +260,39 @@ if run:
         merged = sku_df.copy()
         merged["cost_price"] = 0
 
-    for col in ["revenue", "discount_points", "ozon_reward", "partner_programs", "logistics", "acquiring", "returns", "ads", "other_expenses", "cost_price", "qty"]:
+    for col in ["revenue", "discount_points", "ozon_reward", "partner_programs", "logistics", "acquiring", "returns", "ads", "other_expenses", "cost_price", "qty", "ozon_net_raw"]:
         if col not in merged.columns:
             merged[col] = 0.0
         merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0)
 
-    # Блок 1: Продажи
-    merged["sales"] = (
-        merged["revenue"]
-        + merged["partner_programs"]
-        + merged["discount_points"]
-        - merged["returns"].abs()   # возвраты вычитаем по модулю
-    )
+    # Детальные блоки (могут не совпадать с сырым итогом)
+    merged["sales"] = merged["revenue"] + merged["partner_programs"] + merged["discount_points"] - merged["returns"].abs()
+    merged["accruals_detail"] = merged["ozon_reward"] + merged["logistics"] + merged["acquiring"] + merged["ads"] + merged["other_expenses"]
 
-    # Блок 2: Начисления (все остальное с знаками)
-    merged["accruals"] = (
-        merged["ozon_reward"]
-        + merged["logistics"]
-        + merged["acquiring"]
-        + merged["ads"]
-        + merged["other_expenses"]
-    )
+    # Итого Ozon — из сырого total_amount (правильное)
+    merged["ozon_net"] = merged["ozon_net_raw"]
 
-    # Итого от Ozon
-    merged["ozon_net"] = merged["sales"] + merged["accruals"]
-
-    # Себестоимость
     merged["cost_total"] = merged["cost_price"] * merged["qty"]
-
-    # Прибыль
     merged["profit"] = merged["ozon_net"] - merged["cost_total"]
     merged["margin_pct"] = (merged["profit"] / merged["revenue"].replace(0, pd.NA) * 100).fillna(0).round(1)
 
     progress.progress(100)
     status.success("Готово")
 
-    st.info(f"Сырой итог total_amount из API: {raw_total:,.0f} ₽")
+    st.info(f"Сырой итог total_amount: {raw_total:,.0f} ₽ | Не привязано к SKU: {shared:,.0f} ₽")
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Продажи", f"{merged['sales'].sum():,.0f} ₽")
-    c2.metric("Начисления", f"{merged['accruals'].sum():,.0f} ₽")
-    c3.metric("Итого Ozon", f"{merged['ozon_net'].sum():,.0f} ₽")
-    c4.metric("Себестоимость", f"{merged['cost_total'].sum():,.0f} ₽")
-    c5.metric("Прибыль", f"{merged['profit'].sum():,.0f} ₽")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Итого Ozon", f"{merged['ozon_net'].sum():,.0f} ₽")
+    c2.metric("Себестоимость", f"{merged['cost_total'].sum():,.0f} ₽")
+    c3.metric("Прибыль", f"{merged['profit'].sum():,.0f} ₽")
+    c4.metric("Выручка (деталь)", f"{merged['revenue'].sum():,.0f} ₽")
 
     st.subheader("Позиции")
     display_cols = [
         "sku", "offer_id", "name", "qty",
-        "revenue", "partner_programs", "discount_points", "returns",
-        "sales",
-        "ozon_reward", "logistics", "acquiring", "ads", "other_expenses",
-        "accruals",
-        "ozon_net",
-        "cost_total",
-        "profit", "margin_pct"
+        "ozon_net", "cost_total", "profit", "margin_pct",
+        "revenue", "discount_points", "partner_programs", "returns",
+        "ozon_reward", "logistics", "acquiring", "ads", "other_expenses"
     ]
     display_cols = [c for c in display_cols if c in merged.columns]
 
@@ -298,27 +301,25 @@ if run:
         "offer_id": "Артикул",
         "name": "Название",
         "qty": "Шт",
+        "ozon_net": "Итого Ozon",
+        "cost_total": "Себестоимость",
+        "profit": "Прибыль",
+        "margin_pct": "Маржа %",
         "revenue": "Выручка",
-        "partner_programs": "Партнёры",
         "discount_points": "Баллы",
+        "partner_programs": "Партнёры",
         "returns": "Возвраты",
-        "sales": "Продажи",
         "ozon_reward": "Вознаграждение",
         "logistics": "Логистика",
         "acquiring": "Эквайринг",
         "ads": "Реклама",
-        "other_expenses": "Прочие",
-        "accruals": "Начисления",
-        "ozon_net": "Итого Ozon",
-        "cost_total": "Себестоимость",
-        "profit": "Прибыль",
-        "margin_pct": "Маржа %"
+        "other_expenses": "Прочие"
     }
-    display_df = merged[display_cols].rename(columns=col_names).sort_values("Выручка", ascending=False)
+    display_df = merged[display_cols].rename(columns=col_names).sort_values("Итого Ozon", ascending=False)
 
     st.dataframe(display_df, use_container_width=True, height=650)
 
     st.download_button("📥 CSV", display_df.to_csv(index=False).encode("utf-8-sig"), "unit_economics.csv", "text/csv")
 
 st.markdown("---")
-st.caption("Продажи = Выручка + Партнёры + Баллы − Возвраты. Начисления = всё остальное. Итого Ozon = Продажи + Начисления. Прибыль = Итого Ozon − Себестоимость.")
+st.caption("Итого Ozon и Прибыль считаются из total_amount каждого начисления (совпадает с кабинетом). Колонки Выручка/Баллы/Вознаграждение — детальная разбивка.")
