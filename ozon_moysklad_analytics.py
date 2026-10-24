@@ -110,27 +110,24 @@ def aggregate_by_sku(accruals, type_map):
             if not sku or sku == "0":
                 continue
 
-            # Commission — главное
+            qty = float(prod.get("quantity") or 1)
+            sku_data[sku]["qty"] += qty
+
             comm = prod.get("commission")
             if isinstance(comm, dict):
-                # Выручка
                 sale_amt = comm.get("sale_amount") or {}
                 if isinstance(sale_amt, dict):
                     sku_data[sku]["revenue"] += float(sale_amt.get("amount") or 0)
-                # Баллы
                 bonus = comm.get("bonus") or {}
                 if isinstance(bonus, dict):
                     sku_data[sku]["discount_points"] += float(bonus.get("amount") or 0)
-                # Вознаграждение Ozon
                 sale_comm = comm.get("sale_commission") or comm.get("commission") or {}
                 if isinstance(sale_comm, dict):
                     sku_data[sku]["ozon_reward"] += float(sale_comm.get("amount") or 0)
-                # Программы партнёров
                 coinv = comm.get("coinvestment") or {}
                 if isinstance(coinv, dict):
                     sku_data[sku]["partner_programs"] += float(coinv.get("amount") or 0)
 
-            # Delivery services
             delivery = prod.get("delivery") or {}
             for svc in delivery.get("services") or []:
                 type_id = svc.get("type_id")
@@ -138,7 +135,6 @@ def aggregate_by_sku(accruals, type_map):
                 cat = categorize_type(type_id, type_map)
                 sku_data[sku][cat] += amount
 
-        # item_fees
         item_fees = acc.get("item_fees") or {}
         for fee_group in item_fees.get("fees") or []:
             sku = str(fee_group.get("sku") or "")
@@ -237,19 +233,20 @@ if run:
         merged = sku_df.copy()
         merged["cost_price"] = 0
 
-    for col in ["revenue", "discount_points", "ozon_reward", "partner_programs", "logistics", "acquiring", "returns", "ads", "other_expenses", "cost_price"]:
+    for col in ["revenue", "discount_points", "ozon_reward", "partner_programs", "logistics", "acquiring", "returns", "ads", "other_expenses", "cost_price", "qty"]:
         if col not in merged.columns:
             merged[col] = 0.0
         merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0)
 
-    merged["total_expenses"] = (
+    # Все суммы с знаками как в Озоне
+    merged["sales_total"] = merged["revenue"] + merged["discount_points"] + merged["partner_programs"]
+    merged["accruals_total"] = (
         merged["ozon_reward"] + merged["logistics"] + merged["acquiring"] +
         merged["returns"] + merged["ads"] + merged["other_expenses"]
     )
-    merged["profit"] = (
-        merged["revenue"] + merged["discount_points"] + merged["partner_programs"]
-        - merged["total_expenses"] - merged["cost_price"]
-    )
+    merged["ozon_net"] = merged["sales_total"] + merged["accruals_total"]
+    merged["cost_total"] = merged["cost_price"] * merged["qty"]
+    merged["profit"] = merged["ozon_net"] - merged["cost_total"]
     merged["margin_pct"] = (merged["profit"] / merged["revenue"].replace(0, pd.NA) * 100).fillna(0).round(1)
 
     progress.progress(100)
@@ -257,28 +254,29 @@ if run:
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Выручка", f"{merged['revenue'].sum():,.0f} ₽")
-    c2.metric("Расходы Ozon", f"{merged['total_expenses'].sum():,.0f} ₽")
-    c3.metric("Себестоимость", f"{merged['cost_price'].sum():,.0f} ₽")
+    c2.metric("Начисления", f"{merged['accruals_total'].sum():,.0f} ₽")
+    c3.metric("Себестоимость", f"{merged['cost_total'].sum():,.0f} ₽")
     c4.metric("Прибыль", f"{merged['profit'].sum():,.0f} ₽")
 
     st.subheader("Позиции")
-    display_cols = ["sku", "offer_id", "name", "revenue", "discount_points", "partner_programs", "ozon_reward", "logistics", "acquiring", "returns", "ads", "other_expenses", "cost_price", "profit", "margin_pct"]
+    display_cols = ["sku", "offer_id", "name", "qty", "revenue", "discount_points", "partner_programs", "ozon_reward", "logistics", "acquiring", "returns", "ads", "other_expenses", "cost_total", "profit", "margin_pct"]
     display_cols = [c for c in display_cols if c in merged.columns]
 
     col_names = {
         "sku": "SKU",
         "offer_id": "Артикул",
         "name": "Название",
+        "qty": "Шт",
         "revenue": "Выручка",
-        "discount_points": "Баллы за скидки",
-        "partner_programs": "Программы партнёров",
-        "ozon_reward": "Вознаграждение Ozon",
+        "discount_points": "Баллы",
+        "partner_programs": "Партнёры",
+        "ozon_reward": "Вознаграждение",
         "logistics": "Логистика",
         "acquiring": "Эквайринг",
         "returns": "Возвраты",
         "ads": "Реклама",
         "other_expenses": "Прочие",
-        "cost_price": "Себестоимость",
+        "cost_total": "Себестоимость",
         "profit": "Прибыль",
         "margin_pct": "Маржа %"
     }
@@ -289,4 +287,4 @@ if run:
     st.download_button("📥 CSV", display_df.to_csv(index=False).encode("utf-8-sig"), "unit_economics.csv", "text/csv")
 
 st.markdown("---")
-st.caption("Выручка и баллы теперь берутся из commission.sale_amount и commission.bonus.")
+st.caption("Прибыль = (выручка + баллы + партнёры) + все начисления (с знаками) − себестоимость × шт.")
