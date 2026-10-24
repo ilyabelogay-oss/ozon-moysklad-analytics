@@ -58,35 +58,53 @@ def ozon_post_with_retry(url, headers, payload, max_retries=5):
 @st.cache_data(ttl=300)
 def fetch_ozon_analytics(cid, key, d_from, d_to):
     url = "https://api-seller.ozon.ru/v1/analytics/data"
-    payload = {
-        "date_from": d_from.strftime("%Y-%m-%d"),
-        "date_to": d_to.strftime("%Y-%m-%d"),
-        "metrics": ["revenue", "ordered_units"],
-        "dimension": ["sku"],
-        "limit": 1000,
-        "offset": 0
-    }
-    try:
-        r = ozon_post_with_retry(url, ozon_headers(cid, key), payload)
-        if r.status_code != 200:
-            st.error(f"Озон analytics ошибка {r.status_code}: {r.text}")
-            return pd.DataFrame()
-        data = r.json().get("result", {}).get("data", [])
-        rows = []
-        for item in data:
-            dims = item.get("dimensions", [])
-            mets = item.get("metrics", [])
-            if dims:
-                rows.append({
-                    "sku": str(dims[0].get("id")),
-                    "name": dims[0].get("name"),
-                    "revenue": mets[0] if mets else 0,
-                    "ordered_units": mets[1] if len(mets) > 1 else 0
-                })
-        return pd.DataFrame(rows)
-    except Exception as e:
-        st.error(f"Озон analytics упал: {e}")
-        return pd.DataFrame()
+    all_rows = []
+    offset = 0
+    limit = 1000
+    while True:
+        payload = {
+            "date_from": d_from.strftime("%Y-%m-%d"),
+            "date_to": d_to.strftime("%Y-%m-%d"),
+            "metrics": ["revenue", "ordered_units", "delivered_units"],
+            "dimension": ["sku"],
+            "limit": limit,
+            "offset": offset
+        }
+        try:
+            r = ozon_post_with_retry(url, ozon_headers(cid, key), payload)
+            if r.status_code != 200:
+                st.error(f"Озон analytics ошибка {r.status_code}: {r.text}")
+                break
+            data = r.json().get("result", {}).get("data", [])
+            if not data:
+                break
+            for item in data:
+                dims = item.get("dimensions", [])
+                mets = item.get("metrics", [])
+                if dims:
+                    all_rows.append({
+                        "sku": str(dims[0].get("id")),
+                        "name": dims[0].get("name"),
+                        "revenue": mets[0] if len(mets) > 0 else 0,
+                        "ordered_units": mets[1] if len(mets) > 1 else 0,
+                        "delivered_units": mets[2] if len(mets) > 2 else 0
+                    })
+            if len(data) < limit:
+                break
+            offset += limit
+            time.sleep(0.3)
+        except Exception as e:
+            st.error(f"Озон analytics упал: {e}")
+            break
+    df = pd.DataFrame(all_rows)
+    if not df.empty:
+        # Группируем на случай дублей
+        df = df.groupby(["sku", "name"], as_index=False).agg({
+            "revenue": "sum",
+            "ordered_units": "sum",
+            "delivered_units": "sum"
+        })
+    return df
 
 @st.cache_data(ttl=600)
 def fetch_ozon_sku_to_offer(cid, key, skus):
@@ -225,7 +243,8 @@ if run:
 
         # Сводка
         total_revenue = ozon_sales["revenue"].sum() if not ozon_sales.empty else 0
-        total_units = ozon_sales["ordered_units"].sum() if not ozon_sales.empty else 0
+        total_ordered = ozon_sales["ordered_units"].sum() if not ozon_sales.empty else 0
+        total_delivered = ozon_sales["delivered_units"].sum() if not ozon_sales.empty else 0
 
         # Баллы из realization (может не работать)
         bonus_points = 0
@@ -250,7 +269,9 @@ if run:
                 right_on="ms_code",
                 how="left"
             )
-            merged["cost_total"] = merged["cost_price"].fillna(0) * merged["ordered_units"].fillna(0)
+            # Себестоимость считаем по доставленным, если есть, иначе по заказанным
+            units_for_cost = merged["delivered_units"].fillna(merged["ordered_units"]).fillna(0)
+            merged["cost_total"] = merged["cost_price"].fillna(0) * units_for_cost
             merged["gross_profit"] = merged["revenue"].fillna(0) - merged["cost_total"]
             # Безопасный расчёт маржи
             def calc_margin(row):
@@ -272,13 +293,13 @@ if run:
         # === Метрики ===
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Выручка Ozon", f"{total_revenue:,.0f} ₽")
-        c2.metric("Заказано, шт", f"{total_units:,.0f}")
-        c3.metric("Себестоимость (МС)", f"{merged['cost_total'].sum():,.0f} ₽")
-        c4.metric("Баллы за скидки", f"{bonus_points:,.0f}")
+        c2.metric("Заказано, шт", f"{total_ordered:,.0f}")
+        c3.metric("Доставлено, шт", f"{total_delivered:,.0f}")
+        c4.metric("Себестоимость (МС)", f"{merged['cost_total'].sum():,.0f} ₽")
         c5.metric("Грубая прибыль", f"{merged['gross_profit'].sum():,.0f} ₽")
 
         st.subheader("Товары (матчинг артикул Озона = код МС)")
-        display_cols = ["offer_id", "name", "sku", "revenue", "ordered_units", "cost_price", "cost_total", "gross_profit", "margin_pct", "ms_name", "stock"]
+        display_cols = ["offer_id", "name", "sku", "revenue", "ordered_units", "delivered_units", "cost_price", "cost_total", "gross_profit", "margin_pct", "ms_name", "stock"]
         display_cols = [c for c in display_cols if c in merged.columns]
         
         col_names = {
@@ -287,6 +308,7 @@ if run:
             "sku": "SKU",
             "revenue": "Выручка",
             "ordered_units": "Заказано, шт",
+            "delivered_units": "Доставлено, шт",
             "cost_price": "Себестоимость за шт",
             "cost_total": "Себестоимость итого",
             "gross_profit": "Валовая прибыль",
@@ -320,11 +342,11 @@ if run:
 st.markdown("---")
 st.caption("""
 **Что считается:**
-- Выручка и штуки — analytics/data
+- Выручка, заказано и доставлено — analytics/data (с пагинацией)
 - Артикул — offer_id из product/info/list
 - Себестоимость — report/stock/all из МоегоСклада (price/100)
 - Баллы за скидки — из realization (поле bonus)
 - Расходы — из транзакций (amount), если метод ещё жив
 
-Прибыль = выручка − себестоимость. Комиссии/логистика пока в общей сумме расходов, не раскиданы по SKU (это отдельный геморрой).
+Прибыль = выручка − себестоимость (по доставленным штукам). Комиссии/логистика пока в общей сумме расходов, не раскиданы по SKU.
 """)
