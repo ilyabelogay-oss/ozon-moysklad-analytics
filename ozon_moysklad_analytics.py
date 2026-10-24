@@ -8,7 +8,7 @@ from collections import defaultdict
 st.set_page_config(page_title="Ozon + МойСклад — Юнит-экономика", layout="wide", page_icon="📊")
 
 st.title("📊 Юнит-экономика: Ozon + МойСклад")
-st.caption("Себестоимость из приёмок и оприходований МС.")
+st.caption("Итого Ozon разложено на составляющие. Себестоимость из приёмок и оприходований.")
 
 def get_secret(key, default=""):
     try:
@@ -196,7 +196,6 @@ def fetch_sku_to_offer(cid, key, skus):
 
 @st.cache_data(ttl=600)
 def fetch_ms_costs(token):
-    """Себестоимость из supply + enter"""
     costs = defaultdict(lambda: {"sum_cost": 0.0, "sum_qty": 0.0, "name": ""})
     debug_info = {"supply_docs": 0, "enter_docs": 0, "positions": 0, "errors": []}
 
@@ -303,6 +302,9 @@ if run:
             merged[col] = 0.0
         merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0)
 
+    # Блоки составляющих
+    merged["sales"] = merged["revenue"] + merged["discount_points"] + merged["partner_programs"]
+    merged["expenses"] = merged["ozon_reward"] + merged["logistics"] + merged["acquiring"] + merged["returns"] + merged["ads"] + merged["other_expenses"]
     merged["ozon_net"] = merged["ozon_net_raw"]
     merged["cost_total"] = merged["cost_price"] * merged["qty"]
     merged["profit"] = merged["ozon_net"] - merged["cost_total"]
@@ -313,14 +315,22 @@ if run:
 
     st.info(f"Сырой итог total_amount: {raw_total:,.0f} ₽")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Итого Ozon", f"{merged['ozon_net'].sum():,.0f} ₽")
-    c2.metric("Себестоимость", f"{merged['cost_total'].sum():,.0f} ₽")
-    c3.metric("Прибыль", f"{merged['profit'].sum():,.0f} ₽")
-    c4.metric("Продано шт", f"{merged['qty'].sum():,.0f}")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Продажи", f"{merged['sales'].sum():,.0f} ₽")
+    c2.metric("Расходы", f"{merged['expenses'].sum():,.0f} ₽")
+    c3.metric("Итого Ozon", f"{merged['ozon_net'].sum():,.0f} ₽")
+    c4.metric("Себестоимость", f"{merged['cost_total'].sum():,.0f} ₽")
+    c5.metric("Прибыль", f"{merged['profit'].sum():,.0f} ₽")
 
     st.subheader("Позиции")
-    display_cols = ["sku", "offer_id", "name", "qty", "ozon_net", "cost_price", "cost_total", "profit", "revenue"]
+    display_cols = [
+        "sku", "offer_id", "name", "qty",
+        "revenue", "discount_points", "partner_programs", "sales",
+        "ozon_reward", "logistics", "acquiring", "returns", "ads", "other_expenses", "expenses",
+        "ozon_net",
+        "cost_price", "cost_total",
+        "profit", "margin_pct"
+    ]
     display_cols = [c for c in display_cols if c in merged.columns]
 
     col_names = {
@@ -328,11 +338,22 @@ if run:
         "offer_id": "Артикул",
         "name": "Название",
         "qty": "Шт",
+        "revenue": "Выручка",
+        "discount_points": "Баллы",
+        "partner_programs": "Партнёры",
+        "sales": "Продажи",
+        "ozon_reward": "Вознаграждение",
+        "logistics": "Логистика",
+        "acquiring": "Эквайринг",
+        "returns": "Возвраты",
+        "ads": "Реклама",
+        "other_expenses": "Прочие",
+        "expenses": "Расходы",
         "ozon_net": "Итого Ozon",
         "cost_price": "Себестоимость шт",
         "cost_total": "Себестоимость",
         "profit": "Прибыль",
-        "revenue": "Выручка"
+        "margin_pct": "Маржа %"
     }
     display_df = merged[display_cols].rename(columns=col_names).sort_values("Итого Ozon", ascending=False)
 
@@ -341,4 +362,4 @@ if run:
     st.download_button("📥 CSV", display_df.to_csv(index=False).encode("utf-8-sig"), "unit_economics.csv", "text/csv")
 
 st.markdown("---")
-st.caption("Смотри отладку МойСклад — там видно, сколько документов и позиций нашлось.")
+st.caption("Продажи = Выручка + Баллы + Партнёры. Расходы = Вознаграждение + Логистика + Эквайринг + Возвраты + Реклама + Прочие. Итого Ozon берётся из total_amount.")
