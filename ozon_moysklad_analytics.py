@@ -280,8 +280,24 @@ if run:
         st.subheader("Товары (матчинг артикул Озона = код МС)")
         display_cols = ["offer_id", "name", "sku", "revenue", "ordered_units", "cost_price", "cost_total", "gross_profit", "margin_pct", "ms_name", "stock"]
         display_cols = [c for c in display_cols if c in merged.columns]
+        
+        col_names = {
+            "offer_id": "Артикул",
+            "name": "Название (Ozon)",
+            "sku": "SKU",
+            "revenue": "Выручка",
+            "ordered_units": "Заказано, шт",
+            "cost_price": "Себестоимость за шт",
+            "cost_total": "Себестоимость итого",
+            "gross_profit": "Валовая прибыль",
+            "margin_pct": "Маржа, %",
+            "ms_name": "Название (МС)",
+            "stock": "Остаток"
+        }
+        display_df = merged[display_cols].rename(columns=col_names).sort_values("Выручка", ascending=False)
+        
         st.dataframe(
-            merged[display_cols].sort_values("revenue", ascending=False),
+            display_df,
             use_container_width=True,
             height=500
         )
@@ -296,7 +312,7 @@ if run:
 
         st.download_button(
             "📥 Скачать CSV",
-            merged.to_csv(index=False).encode("utf-8-sig"),
+            display_df.to_csv(index=False).encode("utf-8-sig"),
             "ozon_ms_profit.csv",
             "text/csv"
         )
