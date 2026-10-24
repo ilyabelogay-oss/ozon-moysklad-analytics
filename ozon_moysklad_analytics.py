@@ -8,7 +8,7 @@ from collections import defaultdict
 st.set_page_config(page_title="Ozon + МойСклад — Юнит-экономика", layout="wide", page_icon="📊")
 
 st.title("📊 Юнит-экономика: Ozon + МойСклад")
-st.caption("Итого Ozon берётся из total_amount (совпадает с кабинетом). Блоки — для детализации.")
+st.caption("Итого Ozon из total_amount. Количество штук только из продаж.")
 
 def get_secret(key, default=""):
     try:
@@ -109,7 +109,6 @@ def aggregate_by_sku(accruals, type_map):
         total_amt = float((acc.get("total_amount") or {}).get("amount") or 0)
         raw_total += total_amt
 
-        # Определяем SKU для этого начисления
         skus_in_acc = []
         posting = acc.get("posting") or {}
         for prod in posting.get("products") or []:
@@ -123,28 +122,28 @@ def aggregate_by_sku(accruals, type_map):
             if sku:
                 skus_in_acc.append(sku)
 
-        # Если есть SKU — распределяем total_amount по ним (просто поровну, если несколько)
         if skus_in_acc:
             share = total_amt / len(set(skus_in_acc))
             for sku in set(skus_in_acc):
                 sku_data[sku]["ozon_net_raw"] += share
         else:
-            # Не привязано к SKU — в общий котёл
             sku_data["_shared"]["ozon_net_raw"] += total_amt
 
-        # Детальные компоненты (для разбивки)
         for prod in posting.get("products") or []:
             sku = str(prod.get("sku") or "")
             if not sku or sku == "0":
                 continue
-            qty = float(prod.get("quantity") or 1)
-            sku_data[sku]["qty"] += qty
 
             comm = prod.get("commission")
+            has_sale = False
             if isinstance(comm, dict):
                 sale_amt = comm.get("sale_amount") or {}
-                if isinstance(sale_amt, dict):
+                if isinstance(sale_amt, dict) and float(sale_amt.get("amount") or 0) > 0:
+                    has_sale = True
                     sku_data[sku]["revenue"] += float(sale_amt.get("amount") or 0)
+                    # Количество только из продаж
+                    sku_data[sku]["qty"] += float(prod.get("quantity") or 1)
+
                 bonus = comm.get("bonus") or {}
                 if isinstance(bonus, dict):
                     sku_data[sku]["discount_points"] += float(bonus.get("amount") or 0)
@@ -265,13 +264,7 @@ if run:
             merged[col] = 0.0
         merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0)
 
-    # Детальные блоки (могут не совпадать с сырым итогом)
-    merged["sales"] = merged["revenue"] + merged["partner_programs"] + merged["discount_points"] - merged["returns"].abs()
-    merged["accruals_detail"] = merged["ozon_reward"] + merged["logistics"] + merged["acquiring"] + merged["ads"] + merged["other_expenses"]
-
-    # Итого Ozon — из сырого total_amount (правильное)
     merged["ozon_net"] = merged["ozon_net_raw"]
-
     merged["cost_total"] = merged["cost_price"] * merged["qty"]
     merged["profit"] = merged["ozon_net"] - merged["cost_total"]
     merged["margin_pct"] = (merged["profit"] / merged["revenue"].replace(0, pd.NA) * 100).fillna(0).round(1)
@@ -285,13 +278,13 @@ if run:
     c1.metric("Итого Ozon", f"{merged['ozon_net'].sum():,.0f} ₽")
     c2.metric("Себестоимость", f"{merged['cost_total'].sum():,.0f} ₽")
     c3.metric("Прибыль", f"{merged['profit'].sum():,.0f} ₽")
-    c4.metric("Выручка (деталь)", f"{merged['revenue'].sum():,.0f} ₽")
+    c4.metric("Продано шт", f"{merged['qty'].sum():,.0f}")
 
     st.subheader("Позиции")
     display_cols = [
         "sku", "offer_id", "name", "qty",
         "ozon_net", "cost_total", "profit", "margin_pct",
-        "revenue", "discount_points", "partner_programs", "returns",
+        "revenue", "discount_points", "partner_programs",
         "ozon_reward", "logistics", "acquiring", "ads", "other_expenses"
     ]
     display_cols = [c for c in display_cols if c in merged.columns]
@@ -308,7 +301,6 @@ if run:
         "revenue": "Выручка",
         "discount_points": "Баллы",
         "partner_programs": "Партнёры",
-        "returns": "Возвраты",
         "ozon_reward": "Вознаграждение",
         "logistics": "Логистика",
         "acquiring": "Эквайринг",
@@ -322,4 +314,4 @@ if run:
     st.download_button("📥 CSV", display_df.to_csv(index=False).encode("utf-8-sig"), "unit_economics.csv", "text/csv")
 
 st.markdown("---")
-st.caption("Итого Ozon и Прибыль считаются из total_amount каждого начисления (совпадает с кабинетом). Колонки Выручка/Баллы/Вознаграждение — детальная разбивка.")
+st.caption("Количество штук считается только из записей с продажей. Себестоимость = цена из МС × шт.")
