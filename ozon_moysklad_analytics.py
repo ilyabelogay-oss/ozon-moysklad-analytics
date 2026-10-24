@@ -8,7 +8,7 @@ from collections import defaultdict
 st.set_page_config(page_title="Ozon + МойСклад — Юнит-экономика", layout="wide", page_icon="📊")
 
 st.title("📊 Юнит-экономика: Ozon + МойСклад")
-st.caption("Итого Ozon разложено на составляющие. Себестоимость из приёмок и оприходований.")
+st.caption("Продажи считаются без дублей. Итого Ozon из total_amount.")
 
 def get_secret(key, default=""):
     try:
@@ -137,19 +137,22 @@ def aggregate_by_sku(accruals, type_map):
             comm = prod.get("commission")
             if isinstance(comm, dict):
                 sale_amt = comm.get("sale_amount") or {}
-                if isinstance(sale_amt, dict) and float(sale_amt.get("amount") or 0) > 0:
-                    sku_data[sku]["revenue"] += float(sale_amt.get("amount") or 0)
+                sale_val = float(sale_amt.get("amount") or 0) if isinstance(sale_amt, dict) else 0
+                if sale_val > 0:
+                    sku_data[sku]["revenue"] += sale_val
                     sku_data[sku]["qty"] += float(prod.get("quantity") or 1)
 
                 bonus = comm.get("bonus") or {}
                 if isinstance(bonus, dict):
                     sku_data[sku]["discount_points"] += float(bonus.get("amount") or 0)
-                sale_comm = comm.get("sale_commission") or comm.get("commission") or {}
-                if isinstance(sale_comm, dict):
-                    sku_data[sku]["ozon_reward"] += float(sale_comm.get("amount") or 0)
+
                 coinv = comm.get("coinvestment") or {}
                 if isinstance(coinv, dict):
                     sku_data[sku]["partner_programs"] += float(coinv.get("amount") or 0)
+
+                sale_comm = comm.get("sale_commission") or comm.get("commission") or {}
+                if isinstance(sale_comm, dict):
+                    sku_data[sku]["ozon_reward"] += float(sale_comm.get("amount") or 0)
 
             delivery = prod.get("delivery") or {}
             for svc in delivery.get("services") or []:
@@ -302,14 +305,20 @@ if run:
             merged[col] = 0.0
         merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0)
 
+    # Продажи без дублей: выручка + баллы + партнёры
+    # (баллы и партнёры уже в комиссии, не дублируем выручку)
     merged["sales"] = merged["revenue"] + merged["discount_points"] + merged["partner_programs"]
-    merged["expenses"] = merged["ozon_reward"] + merged["logistics"] + merged["acquiring"] + merged["returns"] + merged["ads"] + merged["other_expenses"]
+
+    merged["expenses"] = (
+        merged["ozon_reward"] + merged["logistics"] + merged["acquiring"] +
+        merged["returns"] + merged["ads"] + merged["other_expenses"]
+    )
+
     merged["ozon_net"] = merged["ozon_net_raw"]
     merged["cost_total"] = merged["cost_price"] * merged["qty"]
     merged["profit"] = merged["ozon_net"] - merged["cost_total"]
     merged["margin_pct"] = (merged["profit"] / merged["revenue"].replace(0, pd.NA) * 100).fillna(0).round(1)
 
-    # Общая маржа
     total_revenue = merged["revenue"].sum()
     total_profit = merged["profit"].sum()
     overall_margin = (total_profit / total_revenue * 100) if total_revenue > 0 else 0
@@ -320,21 +329,20 @@ if run:
     st.info(f"Сырой итог total_amount: {raw_total:,.0f} ₽")
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Продажи", f"{merged['sales'].sum():,.0f} ₽")
-    c2.metric("Расходы", f"{merged['expenses'].sum():,.0f} ₽")
-    c3.metric("Итого Ozon", f"{merged['ozon_net'].sum():,.0f} ₽")
-    c4.metric("Себестоимость", f"{merged['cost_total'].sum():,.0f} ₽")
-    c5.metric("Прибыль", f"{merged['profit'].sum():,.0f} ₽")
-    c6.metric("Маржа", f"{overall_margin:.1f} %")
+    c1.metric("Выручка", f"{merged['revenue'].sum():,.0f} ₽")
+    c2.metric("Баллы + Партнёры", f"{(merged['discount_points'] + merged['partner_programs']).sum():,.0f} ₽")
+    c3.metric("Продажи", f"{merged['sales'].sum():,.0f} ₽")
+    c4.metric("Итого Ozon", f"{merged['ozon_net'].sum():,.0f} ₽")
+    c5.metric("Себестоимость", f"{merged['cost_total'].sum():,.0f} ₽")
+    c6.metric("Прибыль / Маржа", f"{merged['profit'].sum():,.0f} ₽ / {overall_margin:.1f}%")
 
     st.subheader("Позиции")
     display_cols = [
         "sku", "offer_id", "name", "qty",
         "revenue", "discount_points", "partner_programs", "sales",
-        "ozon_reward", "logistics", "acquiring", "returns", "ads", "other_expenses", "expenses",
+        "ozon_reward", "logistics", "acquiring", "returns",
         "ozon_net",
-        "cost_price", "cost_total",
-        "profit", "margin_pct"
+        "cost_total", "profit", "margin_pct"
     ]
     display_cols = [c for c in display_cols if c in merged.columns]
 
@@ -351,11 +359,7 @@ if run:
         "logistics": "Логистика",
         "acquiring": "Эквайринг",
         "returns": "Возвраты",
-        "ads": "Реклама",
-        "other_expenses": "Прочие",
-        "expenses": "Расходы",
         "ozon_net": "Итого Ozon",
-        "cost_price": "Себестоимость шт",
         "cost_total": "Себестоимость",
         "profit": "Прибыль",
         "margin_pct": "Маржа %"
@@ -367,4 +371,4 @@ if run:
     st.download_button("📥 CSV", display_df.to_csv(index=False).encode("utf-8-sig"), "unit_economics.csv", "text/csv")
 
 st.markdown("---")
-st.caption("Маржа % = Прибыль / Выручка × 100. Общая маржа — по всем позициям.")
+st.caption("Продажи = Выручка + Баллы + Партнёры. Итого Ozon и Прибыль от total_amount.")
