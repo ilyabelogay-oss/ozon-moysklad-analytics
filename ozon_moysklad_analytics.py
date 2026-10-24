@@ -269,8 +269,9 @@ if run:
             sku_df["revenue"] = sku_df["analytics_revenue"]
         else:
             sku_df = sku_df.merge(analytics[["sku", "analytics_revenue", "ordered_units", "delivered_units", "name"]], on="sku", how="outer")
-            # если в accrual нет выручки — берём из analytics
-            sku_df["revenue"] = sku_df.get("revenue", 0).fillna(0)
+            if "revenue" not in sku_df.columns:
+                sku_df["revenue"] = 0.0
+            sku_df["revenue"] = sku_df["revenue"].fillna(0)
             sku_df["revenue"] = sku_df.apply(
                 lambda r: r["analytics_revenue"] if r["revenue"] == 0 else r["revenue"], axis=1
             )
