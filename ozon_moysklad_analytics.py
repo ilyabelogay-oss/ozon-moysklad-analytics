@@ -252,16 +252,19 @@ if run:
             )
             merged["cost_total"] = merged["cost_price"].fillna(0) * merged["ordered_units"].fillna(0)
             merged["gross_profit"] = merged["revenue"].fillna(0) - merged["cost_total"]
-            # Безопасный расчёт маржи без краша на NaN
-            revenue_safe = merged["revenue"].fillna(0)
-            merged["margin_pct"] = (merged["gross_profit"] / revenue_safe.replace(0, pd.NA) * 100).round(1)
-            merged["margin_pct"] = merged["margin_pct"].fillna(0)
+            # Безопасный расчёт маржи
+            def calc_margin(row):
+                rev = row["revenue"] or 0
+                if rev == 0:
+                    return 0.0
+                return round(row["gross_profit"] / rev * 100, 1)
+            merged["margin_pct"] = merged.apply(calc_margin, axis=1)
         else:
             merged = ozon_sales.copy()
             merged["cost_price"] = 0
             merged["cost_total"] = 0
             merged["gross_profit"] = merged.get("revenue", 0)
-            merged["margin_pct"] = None
+            merged["margin_pct"] = 0
 
         progress.progress(100)
         status.success("Готово. Смотри цифры, не обосрись.")
