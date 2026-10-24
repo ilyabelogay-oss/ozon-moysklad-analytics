@@ -103,7 +103,10 @@ def categorize_type(type_id, type_map):
 
 def aggregate_by_sku(accruals, type_map):
     sku_data = defaultdict(lambda: defaultdict(float))
+    raw_total = 0.0
     for acc in accruals:
+        raw_total += float((acc.get("total_amount") or {}).get("amount") or 0)
+
         posting = acc.get("posting") or {}
         for prod in posting.get("products") or []:
             sku = str(prod.get("sku") or "")
@@ -147,7 +150,7 @@ def aggregate_by_sku(accruals, type_map):
                 sku_data[sku][cat] += amount
 
     rows = [{"sku": sku, **dict(data)} for sku, data in sku_data.items()]
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), raw_total
 
 @st.cache_data(ttl=600)
 def fetch_sku_to_offer(cid, key, skus):
@@ -211,7 +214,7 @@ if run:
 
     status.info("Агрегация по SKU...")
     progress.progress(60)
-    sku_df = aggregate_by_sku(accruals, type_map)
+    sku_df, raw_total = aggregate_by_sku(accruals, type_map)
 
     if sku_df.empty:
         st.warning("Не удалось собрать данные")
@@ -238,7 +241,6 @@ if run:
             merged[col] = 0.0
         merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0)
 
-    # Все суммы с знаками как в Озоне
     merged["sales_total"] = merged["revenue"] + merged["discount_points"] + merged["partner_programs"]
     merged["accruals_total"] = (
         merged["ozon_reward"] + merged["logistics"] + merged["acquiring"] +
@@ -252,14 +254,16 @@ if run:
     progress.progress(100)
     status.success("Готово")
 
+    st.info(f"Сырой итог всех total_amount из API: {raw_total:,.0f} ₽ (должен быть близко к «Итого» в кабинете)")
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Выручка", f"{merged['revenue'].sum():,.0f} ₽")
-    c2.metric("Начисления", f"{merged['accruals_total'].sum():,.0f} ₽")
+    c2.metric("Итого от Ozon", f"{merged['ozon_net'].sum():,.0f} ₽")
     c3.metric("Себестоимость", f"{merged['cost_total'].sum():,.0f} ₽")
     c4.metric("Прибыль", f"{merged['profit'].sum():,.0f} ₽")
 
     st.subheader("Позиции")
-    display_cols = ["sku", "offer_id", "name", "qty", "revenue", "discount_points", "partner_programs", "ozon_reward", "logistics", "acquiring", "returns", "ads", "other_expenses", "cost_total", "profit", "margin_pct"]
+    display_cols = ["sku", "offer_id", "name", "qty", "revenue", "discount_points", "partner_programs", "ozon_reward", "logistics", "acquiring", "returns", "ads", "other_expenses", "ozon_net", "cost_total", "profit", "margin_pct"]
     display_cols = [c for c in display_cols if c in merged.columns]
 
     col_names = {
@@ -276,6 +280,7 @@ if run:
         "returns": "Возвраты",
         "ads": "Реклама",
         "other_expenses": "Прочие",
+        "ozon_net": "Итого Ozon",
         "cost_total": "Себестоимость",
         "profit": "Прибыль",
         "margin_pct": "Маржа %"
@@ -287,4 +292,4 @@ if run:
     st.download_button("📥 CSV", display_df.to_csv(index=False).encode("utf-8-sig"), "unit_economics.csv", "text/csv")
 
 st.markdown("---")
-st.caption("Прибыль = (выручка + баллы + партнёры) + все начисления (с знаками) − себестоимость × шт.")
+st.caption("Итого Ozon = выручка + баллы + партнёры + все начисления. Прибыль = Итого Ozon − себестоимость. Сырой итог — для сверки с кабинетом.")
